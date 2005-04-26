@@ -1,0 +1,13 @@
+#!perl -w
+
+use Seq;
+
+my $indexname = shift;
+#my $index = Seq->open_read($indexname); # make sure it exists
+#die unless $index;
+#$index->close_index;
+
+Seq::optimize_index($indexname);
+
+exit;
+
