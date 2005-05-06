@@ -24,3 +24,8 @@ Revision history for Perl extension Freq.
 0.25 Tue Apr 26 11:42:56 PDT 2005
 	- changed name to Seq.
 
+0.26 
+	- Replaced CDB disk hash backend with SQLite. Slower retrieval but has no size limit.
+
+0.27 Fri May  6 12:58:02 PDT 2005
+	- Replaced closure-based syntax tree with a merge-based, evaluated static tree, providing substantial speedup by eliminating subroutine calls.

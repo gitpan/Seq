@@ -74,15 +74,16 @@ Seq::optimize_index('od0-1');
 
 
 $index = Seq->open_read( 'od01' );
-my $gods01 = Seq::_read_isr($index->{cdb}, 'gods');
+my $gods01 = Seq::_read_isr($index->{dbh}, 'gods');
 $index->close_index();
 
 $index = Seq->open_read( 'od0-1' );
-my $gods0_1 = Seq::_read_isr($index->{cdb}, 'gods');
+my $gods0_1 = Seq::_read_isr($index->{dbh}, 'gods');
 $index->close_index();
 
 is_deeply($gods01, $gods0_1, 'odyssey isr compaction correct');
 
 
 exit 0;
+
 

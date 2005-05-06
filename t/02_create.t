@@ -30,10 +30,11 @@ ok( $retval, 'index closed' );
 
 $index = Seq->open_read('testindex');
 ok( $index, 'index opened' );
-my $thedeserializedisr = Seq::_read_isr($index->{cdb}, 'the');
+my $thedeserializedisr = Seq::_read_isr($index->{dbh}, 'the');
 
 is_deeply($thedeserializedisr, $theisr, 'isr deserialize correct');
 
 
 exit 0;
+
 

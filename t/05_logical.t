@@ -1,5 +1,5 @@
 
-use Test::More tests => 14;
+use Test::More tests => 12;
 use Seq;
 
 my $index = Seq->open_read( 'testindex' );
@@ -74,16 +74,16 @@ is_deeply( $result,
            [[ './t/data/book10' => 160, 3 ]],
            'boolean AND within sequence');
 
-$result = $index->search('<he gave his {hoohaaa}>');
-is_deeply( $result, 
-           [[ './t/data/book10' => 160, 3 ]],
-           'boolean NOT within sequence (no point actually)');
-
-$result = $index->search("(<he gave his daughters> {dainties})");
-is_deeply( $result, 
-           [],
-           'boolean NOT within AND');
-
+#$result = $index->search('<he gave his {hoohaaa}>');
+#is_deeply( $result, 
+#           [[ './t/data/book10' => 160, 3 ]],
+#           'boolean NOT within sequence (no point actually)');
+#
+#$result = $index->search("(<he gave his daughters> {dainties})");
+#is_deeply( $result, 
+#           [],
+#           'boolean NOT within AND');
+#
 # Still get error on this
 #$result = $index->search('(<he gave his daughters> {<innumerable dainties>})');
 #is_deeply( $result, 
@@ -94,4 +94,5 @@ is_deeply( $result,
 $index->close_index();
 
 exit 0;
+
 

@@ -7,23 +7,26 @@ no warnings "recursion";
 use vars qw( $VERSION );
 
 use FileHandle;
-use CDB_File;
-use Digest::MD5 qw{ md5 };
+use DBI;
+use MIME::Base64;
 
-# Constants for data about each word.
-use constant NDOCS  => 0;
-use constant NWORDS => 1;
-use constant DX     => 2; # doc index
-use constant PX     => 3; # position index
-use constant LASTDOC => 4;
-
-$VERSION = '0.25';
+$VERSION = '0.27';
 use Inline Config =>
-            VERSION => '0.25',
+            VERSION => '0.27',
             NAME => 'Seq';
 use Inline 'C';
 
 
+# Constants for data about each word.
+use constant NDOCS   => 0;
+use constant NWORDS  => 1;
+use constant DX      => 2; # doc index
+use constant PX      => 3; # position index
+use constant LASTDOC => 4;
+use constant FLAGS   => 5; #
+
+# flag values
+use constant COMPOSITE => 1; # an isr with more than one token in length
 
 
 sub open_write {
@@ -77,14 +80,12 @@ sub open_read {
     if( -e "$path/conf" ){
         $self = _configure($path);
 
-        my %cdb;
-        tie %cdb, 'CDB_File', "$path/0/CDB" or die $!;
-        $self->{cdb} = \%cdb;
+        $self->{dbh} = DBI->connect("dbi:SQLite:dbname=$path/0/db","","")
+          or die $DBI::errstr;
 
-        open(IDS, "<$path/0/ids") or die $!;
-        chomp( @{ $self->{ids} } = <IDS> );
-        close IDS;
-
+        @{ $self->{ids} } = map { $_->[0] } 
+                       @{ dbselect( $self->{dbh}, 
+                                    "select xid from docs order by id" ) };
         $self->{xids} = 
             { map { $self->{ids}->[$_] => $_ } 
                 0..scalar @{$self->{ids}}-1 };
@@ -98,11 +99,28 @@ sub open_read {
         return undef;
     }
 
-    isrcache_init($self->{cdb});
+    isrcache_init($self->{dbh});
     return bless $self, $type;
 }
 
+sub dbselect {
+  my $dbh = shift;
+  my $sql = shift;
+  my $sth = $dbh->prepare($sql);
+  $sth->execute(@_);
+  my $ref = $sth->fetchall_arrayref;
+  $sth->finish;
+  return $ref;
+}
 
+sub dbinsert {
+  my $dbh = shift;
+  my $sql = shift;
+  my $sth = $dbh->prepare($sql);
+  my $retval = $sth->execute(@_);
+  $sth->finish;
+  return $retval;
+}
 
 sub close_index {
     my $self = shift;
@@ -111,6 +129,7 @@ sub close_index {
         $self->_write_segment();
     }
     else {
+        $self->{dbh}->disconnect;
         $self->DESTROY;
     }
 
@@ -119,8 +138,8 @@ sub close_index {
 
 sub DESTROY {
     my $self = shift;
-    untie %{ $self->{cdb} };
     @{ $self->{ids} } = ();
+    %{ $self->{xids} } = ();
     $self = undef;
     return 1;
 }
@@ -137,11 +156,16 @@ sub tokenize_std {
 
 
 sub _read_isr {
-    my $cdb = shift;
+    my $dbh = shift;
     my $word = shift;
+    my $ref = dbselect( $dbh, "select isr from isrs where word=?", ":$word");
+    return new_isr() unless $ref and @$ref;
+    return _deserialize_isr($ref->[0]->[0]);
+}
+
+sub _deserialize_isr {
+    my $ISR = decode_base64 $_[0];
     my $isr = new_isr();
-    #return $isr unless exists $cdb->{$word};
-    my $ISR = $cdb->{$word};
 
     my($ndocs, $nwords, $lastdoc, $dxlen) = unpack "L4", $ISR;
     substr($ISR, 0, 16) = '';
@@ -227,10 +251,19 @@ sub new_isr {
     $isr->[DX] = '';
     $isr->[PX] = [];
     $isr->[LASTDOC] = 0;
+    $isr->[FLAGS] = 0;
     return $isr;
 }
 
 
+sub newsegment {
+    my $path = shift;
+    my $dbh = DBI->connect( "dbi:SQLite:dbname=$path/db", "", "",
+      { AutoCommit => 0 } ) or die $DBI::errstr;
+    $dbh->do( "create table isrs ( word text primary key, isr blob not null)");
+    $dbh->do( "create table docs ( id integer primary key autoincrement, xid text unique )");
+    return $dbh;
+}
 
 sub _write_segment {
     my $self = shift;
@@ -238,11 +271,10 @@ sub _write_segment {
     my $nsegments = $self->{nsegments}++;
     my $isrs = $self->{isrs};
     my $count = 0;
-   
+
     mkdir "$path/$nsegments";
-    my $new = new CDB_File("$path/$nsegments/NEW", 
-                            "$path/$nsegments/CDB.tmp") or 
-        die "$0: new CDB_File failed: $!\n";
+    my $dbh = newsegment("$path/$nsegments");
+    my $sth = $dbh->prepare("insert into isrs values (?, ?)");
 
     my @words = keys %$isrs;
     for my $word ( @words ){
@@ -251,25 +283,26 @@ sub _write_segment {
             print STDERR chr(13), "(", $count, ")\t\t";
         }
 
-        $new->insert($word, _serialize_isr($isrs->{$word}));
+		$sth->execute(":$word", _serialize_isr($isrs->{$word}))
+          or print STDERR "insert of $word failed.\n";
         delete $isrs->{$word};
     }
 
     %{ $isrs } = ();
 
-    $new->finish or die $!;
+    $sth->finish;
 
-    rename "$path/$nsegments/NEW", "$path/$nsegments/CDB";
-
-    open IDS, ">$path/$nsegments/ids";
-    print IDS "$_\n" for @{$self->{ids}};
-    close IDS;
+    $sth = $dbh->prepare("insert into docs (xid) values( ? )");
+    $sth->execute($_) for @{$self->{ids}};
+    $sth->finish;
     @{ $self->{ids} } = ();
 
-    # segment conf
+    $dbh->commit;
+    $dbh->disconnect;
+
     open CONF, ">$path/$nsegments/conf";
-    print CONF "seg_nwords:", $self->{seg_nwords}, "\n";
-    print CONF "seg_ndocs:", $self->{seg_ndocs}, "\n";
+    print CONF 'seg_nwords:', $self->{seg_nwords}, "\n";
+    print CONF 'seg_ndocs:', $self->{seg_ndocs}, "\n";
     close CONF;
 
 
@@ -308,7 +341,7 @@ sub _serialize_isr {
     $newisr .= $runlengths;
     $newisr .= join '', @{ $isr->[PX] }; # BER delta lists
 
-    return $newisr;
+    return encode_base64 $newisr;
 }
 
 
@@ -346,13 +379,15 @@ sub optimize_index {
     my (@segments, %words);
     for my $segment (@dirs){
         my $conf = _configure("$path/$segment");
-        my %cdb;
-        tie %cdb, 'CDB_File', "$path/$segment/CDB";
-        my %localwords = ();
-        $localwords{$_} = 1 for grep {length($_) < 26} keys %cdb;
+        my $dbh = DBI->connect("dbi:SQLite:dbname=$path/$segment/db","","") 
+          or die $DBI::errstr;
+        my %localwords = map { $_->[0] => 1 } 
+                         @{ dbselect($dbh, "select word from isrs") };
         $words{$_} = 1 for keys %localwords;
         print STDERR "Gathered ", scalar keys %words, " words at segment $segment.           \r";
-        push @segments, [ $conf, \%cdb, "$path/$segment", \%localwords ];
+        my $sth = $dbh->prepare("select word, isr from isrs order by word");
+        $sth->execute;
+        push @segments, [ $conf, $sth, "$path/$segment", \%localwords, $dbh ];
     }
 
 
@@ -361,13 +396,12 @@ sub optimize_index {
 
     # create new cdb
     print STDERR "Creating new compacted segment.                        \n";
-    my $newidx = new CDB_File("$path/NEWSEGMENT/NEW", 
-                            "$path/NEWSEGMENT/CDB.tmp") or 
-        die "$0: new CDB_File failed: $!\n";
+    my $newidx = newsegment("$path/NEWSEGMENT");
+    my $isrinsert = $newidx->prepare("insert into isrs values(?,?)");
 
     my $ntokens = scalar keys %words;
     my $t0 = time;
-    while(my($word, undef) = each %words){
+    for my $word (sort keys %words){
         $ntokens--;
         if(time-$t0 > 2){
             print STDERR "Compacting $ntokens th word: $word                       \r";
@@ -376,30 +410,37 @@ sub optimize_index {
         my $isr = new_isr();
         my $ndocs = 0;
         for my $segment (@segments){
-            my($conf, $cdb, undef, $localwords) = @$segment;
+            my($conf, $sth, undef, $localwords, $dbh) = @$segment;
             if(exists $localwords->{$word}){ 
-                $isr = _append_isr($isr, $ndocs, _read_isr($cdb, $word));
+                my($dbword, $isr_string) = $sth->fetchrow_array;
+                die "Got $dbword instead of $word!\n" unless $dbword eq $word;
+                $isr = _append_isr($isr, $ndocs, _deserialize_isr($isr_string));
             }
             $ndocs += $conf->{seg_ndocs};
         }
-        $newidx->insert($word, _serialize_isr($isr));
+        $isrinsert->execute($word, _serialize_isr($isr));
     }
+    $isrinsert->finish;
 
-    # write ids file, delete older segments
-    open IDS, ">$path/NEWSEGMENT/ids";
+    # write docs table, delete older segments
+    my $xidinsert = $newidx->prepare("insert into docs (xid) values (?)");
     for my $segment (@segments){
-        print STDERR "Writing document ids for segment ", $segment->[2], ", deleting segment dir.\r";
-        open SEGIDS, $segment->[2] . "/ids"; # path to ids file
-        while(<SEGIDS>){
-            print IDS $_;
+        print STDERR "Writing document ids for segment ", 
+                     $segment->[2], ", deleting segment dir.\r";
+        my $segids = dbselect($segment->[4], "select xid from docs");
+        for(@$segids){
+            $xidinsert->execute($_->[0]);
         }
+        $segment->[1]->finish;
+        $segment->[4]->disconnect;
         unlink glob($segment->[2] . "/*");
         rmdir $segment->[2];
     }
+    $xidinsert->finish;
 
-    print STDERR "\nWriting disk hash.\n";
-    $newidx->finish;
-    rename "$path/NEWSEGMENT/NEW", "$path/NEWSEGMENT/CDB";
+    print STDERR "\nWriting tables.\n";
+    $newidx->commit;
+    $newidx->disconnect;
 
     my ($nwords, $ndocs);
     $nwords += $_->[0]->{seg_nwords} for @segments;
@@ -474,7 +515,7 @@ sub _append_isr {
     my %isrs = ();
     my %nrequests = ();
     my %timestamp = ();
-    my $cdb = {};
+    my $dbh = '';
     my %ids = (); # cached terms -> ids
     my %terms = (); # cached ids -> terms
     my $tid = 0; # term id counter
@@ -483,7 +524,7 @@ sub _append_isr {
     # instantiate the cdb object. That way only 
     # the individual word is necessary to call isr().
     sub isrcache_init {
-        $cdb = shift;
+        $dbh = shift;
     }
 
     # return the isr for a term or id
@@ -491,25 +532,24 @@ sub _append_isr {
         my ($word, $isr) = @_;
         return ($isrs{id($word)} = $isr) if defined $isr; # set
 
+        $isr = exists $isrs{$word} ? $isrs{$word} : _read_isr($dbh,$word);
         # return the empty isr if no occurrence.
-        return new_isr() unless (exists $isrs{$word}) or 
-                                (exists $cdb->{$word});
+        return new_isr() unless $isr;
+ 
         $nrequests{$word}++;
         $timestamp{$word} = time;
-        return $isrs{$word} if exists $isrs{$word};
 
         # About to add to in-memory isr cache, so
         # remove the top 10 isrs according to least-requested and 
         # least-recently requested, if limit reached
-        if(10000 < scalar keys %isrs){
-            my $time = time;
-            my @words = sort { $a <=> $b } 
-                        map { $nrequests{$_} / ($time - $timestamp{$_}) }
-                        keys %isrs;
-            delete $isrs{$_} for @words[0..9];
-        }
+#        if(10000 < scalar keys %isrs){
+#            my $time = time;
+#            my @words = sort { $a <=> $b } 
+#                        map { $nrequests{$_} / ($time - $timestamp{$_}) }
+#                        keys %isrs;
+#            delete $isrs{$_} for @words[0..9];
+#        }
 
-        $isr = _read_isr($cdb, $word);
         $isrs{$word} = $isr;
         return $isr;
     }
@@ -674,9 +714,10 @@ sub query {
                       transcribe_query(
                           canonical($query)));
     return $qtokens[0] if @qtokens == 1;
-    my ($aligner, $matcher) = cq(@qtokens);
+    return 0 unless opener($qtokens[0]);
+    my ($tree) = aq(@qtokens);
     my $canonical = join(" ", @qtokens);
-    isr($canonical, _execute_query($aligner, $matcher)); # add to isr cache
+    isr($canonical, eval_query(@$tree)); # add to isr cache
     return id($canonical);
 }
 
@@ -684,7 +725,7 @@ sub query {
 sub canonical {
     my $qstr = shift;
     $qstr =~ s/[\[\]\|\<\>\(\)\{\}]/ $& /g;
-    $qstr =~ s/\s+(#[wWtT]\d+)/$1/g;
+    $qstr =~ s/(#[wWtT]\d+)/$1/g;
     $qstr =~ s/^\s+//g;
     $qstr =~ s/\s+$//g;
     $qstr =~ s/\s+/ /g;
@@ -728,6 +769,8 @@ sub _execute_query {
         }
         $docid++;
     }
+    $isr->[LASTDOC] = $lastdoc;
+    $isr->[FLAGS] |= COMPOSITE;
 
     return $isr;
 }
@@ -772,14 +815,14 @@ sub set_from_list {
     my $isr = new_isr();
     my $lastdoc = 0;
     $list = $self->xid_iid($list); # xlate into internal ids (in place)
-	
+
     while(@$list){
         my $doc = shift @$list;
         my $docid = shift @$doc;
         $isr->[NDOCS]++;
         $isr->[DX] .= pack("w*", 
                           ($docid-$lastdoc)*2+1, 
-						  scalar @{$isr->[PX]} );
+                            scalar @{$isr->[PX]} );
         push @{ $isr->[PX] }, (@$doc ? pack("w*", @$doc) : (0,0));
         $doc = []; # Destroy! Raaa!
         $lastdoc = $docid;
@@ -799,12 +842,13 @@ sub set_info {
              nwords => $isr->[NWORDS], };
 }
 
-# Translate a result list to sorted internal ids
+# Translate a result list (usually from a db query) to sorted internal ids
 sub xid_iid {
     my($self, $list) = @_;
 
-    $_->[0] = $self->{xids}->{$_->[0]} for @$list; # xlate
-    my @new = sort { $a->[0] <=> $b->[0] } @$list;
+    my @new = 
+      sort { $a->[0] <=> $b->[0] }
+      map { $_->[0] = $self->{xids}->{$_->[0]}; $_ } @$list; # xlate
     return \@new;
 }
 
@@ -815,32 +859,6 @@ sub xid_iid {
 # Return proper aligners/matchers/caps according to operator.
 # This is the place to add new operators.
 {
-    my %aligners = (
-        '<' => \&seq_aligner,
-        '[' => \&or_aligner,
-        '(' => \&seq_aligner,
-        '{' => \&not_aligner,
-    );
-
-    my %matchers = (
-        '<' => \&seq_matcher,
-        '[' => \&or_matcher,
-        '(' => \&and_matcher,
-        '{' => \&not_matcher,
-    );
-
-    # "caps" are code refs that end chains
-    my %caps = (
-        '>' => [ sub { return $_[0] },          # sequence align
-                 sub { return $_[0], $_[0] } ], # sequence match
-        ']' => [ sub { return undef },          # boolean OR align
-                 sub { return () } ],           # boolean OR match
-        ')' => [ sub { return $_[0] },          # boolean AND align
-                 sub { return (-1, -1) } ],     # boolean AND match
-        '}' => [ sub { return $_[0] },          # boolean NOT align
-                 sub { return $_[0], $_[0] } ], # boolean NOT match
-     );
-
     my %ops = (
         '<' => '>',
         '[' => ']',
@@ -848,71 +866,20 @@ sub xid_iid {
         '{' => '}',
     );
 
-
-    sub aligner {
-        my $op = shift;
-        return $aligners{$op}->(@_);
-    }
-
-    sub matcher {
-        my $op = shift;
-        return $matchers{$op}->(@_);
-    }
-
-    sub cap {
-        my $op = shift;
-        return @{ $caps{substr $op,0,1} } 
-            if exists $caps{substr $op,0,1};
-        return undef;
-    }
-
-    sub balanced {
+    sub closer {
         my($left, $right) = @_;
-        return $ops{$left} 
-            if exists $ops{$left} 
-               and ($ops{$left} eq substr($right,0,1));
+        my $op = substr($left,0,1);
+        return $ops{$op} 
+            if exists $ops{$op} 
+               and ($ops{$op} eq substr($right,0,1));
     }
 
-    sub balance {
+    sub opener {
         my $left = shift;
-        return $ops{$left} if exists $ops{$left};
+        my $op = substr($left,0,1);
+        return $ops{$op} if exists $ops{$op};
         return undef;
     }
-}
-
-# Compile Query
-sub cq {
-    return undef unless @_; # empty list
-    my ($op, @rest) = @_;
-
-    my ($align, $nalign, $match, $nmatch, $interval);
-
-    if( balanced($op, $rest[0]) ){ # this chain is done
-        ($interval) = parse_interval($rest[0]);
-        return cap(shift @rest), $interval, @rest;
-    }
-    elsif( balance($rest[0]) ){ # new chain
-        ($align, $match, $interval, @rest) = cq(shift @rest, @rest);
-    }
-    else {
-        my $word = shift @rest;
-        ($interval, $word) = parse_interval($word);
-        ($align, $match) = isr_align_match($word);
-    }
-    ($nalign, $nmatch, @rest) = cq($op, @rest);
-
-    return 
-        aligner($op, $align, $nalign),
-        matcher($op, $match, $nmatch, $interval),
-        @rest;
-}
-
-sub parse_interval {
-    my $word = shift;
-    my ($newword, $interval) = split(/#[wWtT]/, $word);
-    $interval ||= 1;
-    $interval *= -1 if ($word =~ /#[tT]/);
-    return $interval, $newword;
 }
 
 sub min {
@@ -927,214 +894,317 @@ sub min {
 }
 
 
-# returns lowest-valued docid in the chain
-sub or_aligner {
-    my ($this, $next) = @_;
+# new architecture
 
-    return sub {
-        my $pos = shift;
-        my $thispos = $this->($pos);
-        my $nextpos = $next->($pos);
-        return min($thispos, $nextpos);
-    };
-}
+{
+    my %dispatch = (
+        '<' => \&eval_seq,
+        '[' => \&eval_or,
+        '(' => \&eval_and,
+    );
 
-
-# returned function does this:
-# FIND first instance of ($this0, $thisN) match boundaries
-# WHERE $this0 > $top0, $thisN > $topN. 
-# RETURN ($this*) or ($next*) according to min($thisN, $nextN)
-sub or_matcher {
-    my ($this, $next) = @_;
-    my ($this0, $thisN, $next0, $nextN) = (0, 0, 0, 0);
-
-    return sub {
-        my ($top0, $topN) = @_;
-
-        # return NEXT if there is no THIS.
-        return $next->($top0, $topN) unless 
-            ($this0, $thisN) = $this->($top0, $topN); # AND-node or ISR
-
-        # find thisN high enough
-        while($thisN <= $topN){
-            return $next->($top0, $topN) unless
-                ($this0, $thisN) = $this->($this0);
-        }
-
-        # we have a valid THIS, now get neighboring match.
-        return ($this0, $thisN) unless 
-            ($next0, $nextN) = $next->($top0, $topN); # OR-node
-
-        return (min($thisN, $nextN) == $thisN) ?
-               ($this0, $thisN) :
-               ($next0, $nextN);
-    };
-}
-
-
-# returns the highest valued document id in the chain
-sub seq_aligner {
-    my ($this, $next) = @_;
-    my $thispos;
-
-    return sub {
-        my $pos = shift;
-        return undef unless $thispos = $this->($pos);
-        return $next->($thispos);
-    };
-}
-
-# returned function does:
-# FIND first instance of $this* and $next* 
-# WHERE ($next0-$interval) < $thisN < $nextN
-# and $pos < $this0.
-# RETURN ($this0, $nextN)
-sub seq_matcher {
-    my ($this, $next, $interval) = @_;
-    my ($this0, $thisN, $next0, $nextN) = (0, 0, 0, 0);
-    my $exactadjust = ($interval < 0) ? -$interval : 1; 
-    $interval = abs($interval);
-
-    return sub {
-        my $pos = shift;
-        return () unless 
-            ($this0, $thisN) = $this->($pos, $pos); #OR-node or ISR
-        return () unless 
-            ($next0, $nextN) = $next->($thisN+$exactadjust-1); # AND-chain
-        while($thisN < ($next0-$interval)){
-            return () unless 
-                ($this0, $thisN) = $this->($pos, $next0-$interval-1);
-            if($thisN > ($next0-$exactadjust+1)){
-                return () unless 
-                    ($next0, $nextN) = $next->($thisN);
-            }
-        }
-        return ($this0, $nextN);
-    };
-}
-
-# Boolean AND matcher. Same as OR matcher except that all members
-# must be present somewhere in the document.
-# returned function does:
-# returns lowest match position after top*, or () if 1) any member
-# of the chain not found, or 2) if no member > top*.
-sub and_matcher {
-    my ($this, $next) = @_;
-    my ($this0, $thisN, $next0, $nextN) = (0, 0, 0, 0);
-
-    return sub {
-        my ($top0, $topN) = @_;
-
-        # check for existence of THIS member
-        return () unless $this->(0,0);
-
-        # return NEXT if there is no THIS past top*.
-        # (reduce to rest of chain)
-        return $next->($top0, $topN) unless 
-            ($this0, $thisN) = $this->($top0, $topN); # node or ISR
-
-        # find thisN high enough
-        # (reduce to rest of chain)
-        while($thisN <= $topN){
-            return $next->($top0, $topN) unless
-                ($this0, $thisN) = $this->($this0);
-        }
-
-        # return empty if rest of match was missing something
-        return () unless 
-            ($next0, $nextN) = $next->($top0, $topN); # AND-node
-
-        # return THIS unless rest of chain contained match past top*.
-        return ($this0, $thisN) unless
-            $next0 >= $top0;
-
-        return (min($thisN, $nextN) == $thisN) ?
-               ($this0, $thisN) :
-               ($next0, $nextN);
-    };
-}
-
-
-# returns the position (docid) it was handed, always. This allows for
-# matching within sequences. There is no chain associated with this
-# operator. It is unary, therefore it refers to no "next" closure.
-sub not_aligner {
-    my ($this) = @_;
-
-    return sub {
-        my $pos = shift;
-        $this->($pos);
-        return $pos;
-    };
-}
-
-# Boolean context: Returns $pos unless a successful match occurred.
-# If a match occurred, returns the empty list.
-sub not_matcher {
-    my ($this) = @_;
-
-    return sub {
-        my $pos = shift;
-        return ($pos+1, $pos+1) unless $this->(0,0); # no match in doc
-        return (); # match found, return negative
-    };
-}
-
-
-
-sub isr_align_match {
-    my ($word) = @_;
-
-    my $isr = isr($word);
-
-    if(!$isr->[DX]){ # empty isr?
-        return sub { return undef }, # align returns undef
-               sub { return () };    # match returns empty
+    sub dispatch {
+        return undef unless exists $dispatch{substr($_[0],0,1)};
+        return $dispatch{substr($_[0],0,1)};
     }
+}
 
-    my $s2p; # which subroutine for sum_to_pos?
-    if($word =~ /^_\d+_$/){ # cached result set
-        $s2p = \&risr_sum_to_pos;
-    } else {
-        $s2p = \&sum_to_pos;
+# Assemble Query
+sub aq {
+    return undef unless @_; # empty list
+    my ($op, @rest) = @_;
+
+    my ($this, $subquery);
+
+    if( closer($op, $rest[0]) ){ # this chain is done
+        return [ "$op " . shift @rest ], @rest;
     }
+    elsif( opener($rest[0]) ){ # new chain
+        ($subquery, @rest) = aq(shift @rest, @rest);
+        $op .= ' ' .  $subquery->[0];
+    }
+    else {
+        my $word = shift @rest;
+        $op .= " $word";
+        if($word =~ /^#/){
+            $subquery = -$1 if $word =~ /^#[Tt](\d+)$/;
+            $subquery =  $1 if $word =~ /^#[Ww](\d+)$/;
+        } else {
+            $subquery = Seq::isr($word);
+        }
+    }
+    ($this, @rest) = aq($op, @rest);
+    $op = shift @$this;
+    unshift @$this, $subquery;
+    unshift @$this, $op;
 
-    my $docid = 0; # doc id requested
-    my $dxsum = 0; # doc id for this isr
-    my $dxn = 0; # location in DX
-    my $px = ''; # current pos list
-    my $pxsum = 0; # token location in doc
-    my $pxn = 0; # location in PX string
-    my $runlen = 0; # token delta length of match (0 for single term)
-
-    return 
-        sub { # the align
-            $docid = shift;
-            return undef unless defined $dxsum;
-            if($docid > $dxsum){  # new doc
-                ($dxsum, $dxn, $px) = 
-                    sum_to_doc($isr->[DX], $dxsum, $dxn, $docid);
-                $px = defined $px ?
-                          ($px % 2) ? 
-                              $isr->[PX]->[int $px/2] : # string px
-                              pack "w", $px/2 :         # single pos delta
-                          undef;
-                ($pxsum, $pxn) = (0, 0);
-            }
-            return $dxsum;
-        },
-        sub { # the match
-            return () unless (defined $dxsum) and 
-                             ($docid == $dxsum); # the align is valid
-            my (undef, $pos) = @_;
-            if($pxsum <= $pos){
-                ($pxsum, $pxn, $runlen) = $s2p->($px, $pos, $pxn, $pxsum);
-            }
-            return ($pxsum > $pos) ? ($pxsum, $pxsum+$runlen) : ();
-        };
+    return $this, @rest;
 }
 
 
+sub eval_query {
+  my ($qstring, @q) = @_;
+  for(@q){
+    if( ref($_) and opener($_->[0]) ){ # a subquery
+        $_ = eval_query(@$_);
+	}
+  }
+  my $op = dispatch($qstring);
+  return $op->(@q);
+}
+
+sub eval_and {
+  my @and = sort { $a->[1] <=> $b->[1] } @_;
+  my $this = shift @and;
+  while(@and){
+    $this = new_and($this, shift @and);
+  }
+  return $this;
+
+}
+
+sub eval_or {
+  my $this = shift;
+  while(@_){
+    $this = new_or($this, shift);
+  }
+  return $this;
+}
+
+sub eval_seq {
+  my @seq = @_;
+  my $this = shift @seq;
+  while(@seq){
+    my $interval = 1;
+    $interval = shift @seq unless ref $seq[0];
+    $this = new_seq($this, shift @seq, $interval);
+  }
+  return $this;
+}
+
+# dx = and, px = or
+sub new_and {
+  my($isr0, $isr1) = @_;
+  return conjunctive_dx_merge($isr0, $isr1, \&disjunctive_px_merge);
+}
+
+# dx = or, px = or
+sub new_or {
+  my($isr0, $isr1) = @_;
+  return disjunctive_dx_merge($isr0, $isr1);
+}
+
+# dx = and, px = seq
+sub new_seq {
+  my($isr0, $isr1, $interval) = @_;
+  my $pxmerge = sequence_px_merge($isr0, $isr1, $interval);
+  return conjunctive_dx_merge($isr0, $isr1, $pxmerge);
+}
+
+# join two full isrs in an AND relation, combining positions 
+# according to a supplied function
+sub conjunctive_dx_merge {
+    my ($isr0, $isr1, $pxmerge) = @_;
+    return new_isr() unless $isr1->[NDOCS]; # empty isr?
+    my $isr = new_isr();
+
+    my @dx0 = unpack "w*", $isr0->[DX];
+    my @dx1 = unpack "w*", $isr1->[DX];
+    my ($flag0, $flag1) = ($isr0->[FLAGS] & COMPOSITE,
+                           $isr1->[FLAGS] & COMPOSITE);
+    my ($docid, $lastdoc) = (0,0);
+    my @DX; my @PX;
+    while(@dx0 and @dx1){
+        my $cmp = ($dx0[0] >> 1) <=> ($dx1[0] >> 1);
+        if($cmp < 0){ # dx1 is larger
+            $docid += $dx0[0] >> 1; 
+            $dx1[0] = (($dx1[0] >> 1) - ($dx0[0] >> 1)) * 2 + $dx1[0] % 2;
+            shift @dx0; shift @dx0;
+        }
+        elsif ($cmp > 0) { # dx0 is larger
+            $docid += $dx1[0] >> 1; 
+            $dx0[0] = (($dx0[0] >> 1) - ($dx1[0] >> 1)) * 2 + $dx0[0] % 2;
+            shift @dx1; shift @dx1;
+        }
+        else {
+            $docid += $dx0[0] >> 1;
+            my $dx0delta = shift @dx0; 
+            my $dx1delta = shift @dx1;
+            my $px0 = shift @dx0;
+            my $px1 = shift @dx1;
+            $px0 = ($dx0delta % 2) ?
+                      $isr0->[PX]->[$px0] :  # string px
+                      pack "w", $px0;        # single position px
+            $px1 = ($dx1delta % 2) ?
+                      $isr1->[PX]->[$px1] :  # string px
+                      pack "w", $px1;        # single position px
+            my($px, $nmatches) = $pxmerge->($px0, $px1, $flag0, $flag1);
+            next unless $nmatches;
+            $isr->[NWORDS] += $nmatches;
+            $isr->[NDOCS]++;
+            push @DX, ($docid - $lastdoc)*2+1, scalar(@PX);
+            push @PX, $px;
+            $lastdoc = $docid;
+        }
+    }
+    $isr->[DX] = pack "w*", @DX;
+    $isr->[PX] = \@PX;
+    $isr->[LASTDOC] = $lastdoc;
+    $isr->[FLAGS] |= COMPOSITE;
+    return $isr;
+}
+
+
+sub disjunctive_dx_merge {
+    my ($isr0, $isr1) = @_;
+    return $isr0 unless $isr1->[NDOCS]; # empty isr?
+    my $isr = new_isr();
+
+    my @dx0 = unpack "w*", $isr0->[DX];
+    my @dx1 = unpack "w*", $isr1->[DX];
+    my ($flag0, $flag1) = ($isr0->[FLAGS] & COMPOSITE,
+                           $isr1->[FLAGS] & COMPOSITE);
+    my ($docid, $lastdoc) = (0,0);
+    my @DX; my @PX;
+    while(@dx0 and @dx1){
+        my($delta0, $delta1, $px0, $px1, $big, $small, $Sisr, $Bisr, $equal);
+        my $cmp = ($dx0[0] >> 1) <=> ($dx1[0] >> 1);
+        if($cmp < 0){ # dx1 is larger
+            ($big, $small, $Sisr, $equal) = 
+              (\@dx1, \@dx0, $isr0, 0);
+        }
+        elsif ($cmp > 0) { # dx0 is larger
+            ($big, $small, $Sisr, $equal) = 
+              (\@dx0, \@dx1, $isr1, 0);
+        }
+        else {
+            ($big, $small, $Bisr, $Sisr, $equal) = 
+              (\@dx0, \@dx1, $isr0, $isr1, 1);
+        }
+
+        $docid += $small->[0] >> 1;
+        if(!$equal){
+            $big->[0] = 
+              (($big->[0] >> 1) - ($small->[0] >> 1)) * 2 + $big->[0] % 2;
+            $px1 = '';
+        } else {
+            $px1 = get_px($big, $Bisr);
+        }
+        $px0 = get_px($small, $Sisr);
+        $isr->[NDOCS]++;
+        push @DX, ($docid - $lastdoc)*2+1, scalar(@PX);
+        push @PX, disjunctive_px_merge($px0, $px1, $flag0, $flag1);
+        $isr->[NWORDS] += pop @PX;
+        $lastdoc = $docid;
+    }
+    if(@dx0 or @dx1){
+        ($flag0, $isr0, @dx0) = @dx0 ? 
+                                ($flag0, $isr0, @dx0) : 
+                                ($flag1, $isr1, @dx1);
+        while(@dx0){
+            $docid += $dx0[0] >> 1;
+            $isr->[NDOCS]++;
+            push @DX, $dx0[0], scalar @PX;
+            push @PX, disjunctive_px_merge(
+                        get_px(\@dx0, $isr0), '', $flag0, 0);
+            $isr->[NWORDS] += pop @PX;
+        }
+    }
+    $isr->[DX] = pack "w*", @DX;
+    $isr->[PX] = \@PX;
+    $isr->[LASTDOC] = $docid;
+    $isr->[FLAGS] |= COMPOSITE;
+    return $isr;
+}
+
+sub get_px {
+    my ($dx, $isr) = @_;
+    my $delta = shift @$dx;
+    my $px = shift @$dx;
+    $px = ($delta % 2) ?
+           $isr->[PX]->[$px] :  # string px
+           pack "w", $px;        # single position px
+    return $px;
+}
+
+sub disjunctive_px_merge {
+  my (@px0, @px1);
+
+  # Flags indicate whether to upgrade the lists with intervals
+  $_[2] ? 
+    ( @px0 = unpack("w*", $_[0]) ) :
+    ( @px0 = map { $_, 0 } unpack("w*", $_[0]) );
+
+  $_[3] ? 
+    ( @px1 = unpack("w*", $_[1]) ) :
+    ( @px1 = map { $_, 0 } unpack("w*", $_[1]) );
+
+  return pack("w*", @px0), @px0/2 unless @px1;
+  return pack("w*", @px1), @px1/2 unless @px0;
+
+  my @px = ();
+  while(@px0 and @px1){
+    if($px0[0] <= $px1[0]){
+      my ($pxmin, $rlen) = (shift @px0, shift @px0);
+      next unless $pxmin; # don't record zeroes
+      $px1[0] -= $pxmin;
+      push @px, $pxmin, $rlen;
+    }
+    else {
+      my ($pxmin, $rlen) = (shift @px1, shift @px1);
+      next unless $pxmin; # don't record zeroes
+      $px0[0] -= $pxmin;
+      push @px, $pxmin, $rlen;
+    }
+  }
+  push @px, @px0;
+  push @px, @px1;
+  return pack("w*", @px), @px/2;
+}
+
+# curry the interval and summing functions
+sub sequence_px_merge {
+ my ($isr0, $isr1, $interval) = @_;
+
+  # Flags indicate which summing function to use
+  # both are: (pos, string index, runlen) = 
+  #             s2p->(string, min pos, string index, current pos)
+  my($s2p0, $s2p1);
+  $isr0->[FLAGS] & COMPOSITE ? 
+    ($s2p0 = \&risr_sum_to_pos) :
+      ($s2p0 = \&sum_to_pos) ;
+
+  $isr1->[FLAGS] & COMPOSITE ? 
+    ($s2p1 = \&risr_sum_to_pos) :
+      ($s2p1 = \&sum_to_pos) ;
+
+  my $max_int = abs($interval);
+  my $min_int = $interval < 0 ? abs($interval) : 0;
+
+  sub {
+    my ($px0, $px1) = @_;
+
+    my ($sum0, $sum1, $n0, $n1, $pos, $runlen0, $runlen1) = (0,0,0,0,0,0);
+    my @px;
+    my $lastmatch = 0;
+    while( ($sum0, $n0, $runlen0) = 
+             $s2p0->($px0, $pos, $n0, $sum0) ) { # get next position
+      last unless $sum0 > $pos; 
+      $pos = $sum0;
+      if($sum1 < $sum0+$runlen0){
+        ($sum1, $n1, $runlen1) = 
+          $s2p1->($px1, $sum0+$runlen0, $n1, $sum1);
+      }
+      my $span = $sum1 - ($sum0+$runlen0);
+      last unless $span > 0;
+      if( $min_int <= $span and $span <=  $max_int ){
+        push @px, $sum0 - $lastmatch, $sum1+$runlen1 - $sum0; # pos delta, runlen
+        $lastmatch = $sum0;
+      }
+    }
+    return pack("w*", @px), @px/2;
+  }
+}
 
 1;
 
@@ -1360,6 +1430,7 @@ void risr_sum_to_pos(SV* pxSV, int pos, int pxn, int pxsum){
     INLINE_STACK_DONE;
     return;
 }
+
 
 
 

@@ -1,0 +1,14 @@
+# http://module-build.sourceforge.net/META-spec.html
+#XXXXXXX This is a prototype!!!  It will change in the future!!! XXXXX#
+name:         Seq
+version:      0.27
+version_from: Seq.pm
+installdirs:  site
+requires:
+    DBD::SQLite:                   0.01
+    DBI:                           0.01
+    FileHandle:                    0.01
+    Inline:                        0.43
+
+distribution_type: module
+generated_by: ExtUtils::MakeMaker version 6.20
