@@ -10,9 +10,9 @@ use FileHandle;
 use DBI;
 use MIME::Base64;
 
-$VERSION = '0.27';
+$VERSION = '0.28';
 use Inline Config =>
-            VERSION => '0.27',
+            VERSION => '0.28',
             NAME => 'Seq';
 use Inline 'C';
 
@@ -26,7 +26,7 @@ use constant LASTDOC => 4;
 use constant FLAGS   => 5; #
 
 # flag values
-use constant COMPOSITE => 1; # an isr with more than one token in length
+use constant COMPOSITE => 1; # an isr with positions having >0 runlength
 
 
 sub open_write {
@@ -1127,7 +1127,13 @@ sub get_px {
     return $px;
 }
 
+# wrapper to keep same interface
 sub disjunctive_px_merge {
+   my @merged = _disjunctive_px_merge(@_);
+   return pack("w*", @merged), @merged/2;
+}
+
+sub disjunctive_px_merge_perl {
   my (@px0, @px1);
 
   # Flags indicate whether to upgrade the lists with intervals
@@ -1318,7 +1324,7 @@ int next_integer_val(char* px){
         px++;
     }
     value = ((value << 7) | *px);
-    return value;
+    return (int) value;
 }
 
 
@@ -1331,15 +1337,6 @@ void sum_to_pos(SV* pxSV, int pos, int pxn, int pxsum){
     char* px = SvPV_nolen( pxSV );
 
     INLINE_STACK_VARS;
-/*
-    if(strlen(px) <= pxn){
-        INLINE_STACK_RESET;
-        INLINE_STACK_PUSH(sv_2mortal(newSViv(0)));
-        INLINE_STACK_PUSH(sv_2mortal(newSViv(0)));
-        INLINE_STACK_DONE;
-        return;
-    }
-*/
 
     px += pxn; // advance char pointer to current pxn
     while(*px && (pxsum <= pos)){
@@ -1419,7 +1416,7 @@ void risr_sum_to_pos(SV* pxSV, int pos, int pxn, int pxsum){
 
         len = next_integer_length(px);
         runlen = next_integer_val(px);
-           px += len;
+        px += len;
         pxn += len;
     }
     
@@ -1427,6 +1424,124 @@ void risr_sum_to_pos(SV* pxSV, int pos, int pxn, int pxsum){
     INLINE_STACK_PUSH(sv_2mortal(newSViv(pxsum)));
     INLINE_STACK_PUSH(sv_2mortal(newSViv(pxn)));
     INLINE_STACK_PUSH(sv_2mortal(newSViv(runlen)));
+    INLINE_STACK_DONE;
+    return;
+}
+
+
+/* next_px_0
+   takes a px string of type 0 (no runlens encoded) and returns 
+   position delta, runlen (always 0) and string increment.
+*/
+void next_px_0(char* px, int* delta, int* runlen, int* increment){
+    *runlen = 0;
+    *delta = next_integer_val(px);
+    *increment = next_integer_length(px);
+}
+
+/* next_px_1
+   takes a px string of type 1 (runlens encoded) and returns 
+   position delta, runlen and string increment.
+*/
+void next_px_1(char* px, int* delta, int* runlen, int* increment){
+    *delta = next_integer_val(px);
+    *increment = next_integer_length(px);
+    px += *increment;
+    *runlen = next_integer_val(px);
+    *increment += next_integer_length(px);
+}
+
+
+
+/* disjunctive_px_merge
+   takes two px strings of either type and merges them disjunctively
+*/
+
+void _disjunctive_px_merge(SV* px0SV, SV* px1SV, bool type0, bool type1){
+    char* px0 = SvPV_nolen( px0SV );
+    char* px1 = SvPV_nolen( px1SV );
+    int px0inc    = 0,    px1inc = 0;
+    int px0runlen = 0, px1runlen = 0;
+    int px0delta  = 0,  px1delta = 0;
+
+	// coderefs
+    void (*px0_next)(char* px, int* delta, int* runlen, int* increment);
+    void (*px1_next)(char* px, int* delta, int* runlen, int* increment);
+
+    INLINE_STACK_VARS;
+    INLINE_STACK_RESET;
+
+    if(type0){
+        px0_next = next_px_1;
+    } else {
+        px0_next = next_px_0;
+    }
+
+    if(type1){
+        px1_next = next_px_1;
+    } else {
+        px1_next = next_px_0;
+    }
+
+    while(*px0 || *px1){
+        if(px0delta == 0){
+          if(!*px0) break;
+          px0_next(px0, &px0delta, &px0runlen, &px0inc);
+          px0 += px0inc; 
+//printf("px0 draws: delta=%u, runlen=%u, inc=%u\n", px0delta, px0runlen, px0inc);
+        }
+        if(px1delta == 0){
+          if(!*px1) break;
+          px1_next(px1, &px1delta, &px1runlen, &px1inc);
+          px1 += px1inc; 
+//printf("px1 draws: delta=%u, runlen=%u, inc=%u\n", px1delta, px1runlen, px1inc);
+        }
+        if(px0delta < px1delta){
+          INLINE_STACK_PUSH(sv_2mortal(newSViv(px0delta)));
+          INLINE_STACK_PUSH(sv_2mortal(newSViv(px0runlen)));
+//printf("px1 -= px0: %u - %u = %u; write px0\n", px1delta, px0delta, px1delta-px0delta);
+          px1delta -= px0delta;
+          px0delta = 0;
+        } else if(px1delta < px0delta){
+          INLINE_STACK_PUSH(sv_2mortal(newSViv(px1delta)));
+          INLINE_STACK_PUSH(sv_2mortal(newSViv(px1runlen)));
+//printf("px0 -= px1: %u - %u = %u; write px1\n", px0delta, px1delta, px0delta-px1delta);
+          px0delta -= px1delta;
+          px1delta = 0;
+        } else {
+          INLINE_STACK_PUSH(sv_2mortal(newSViv(px0delta)));
+          INLINE_STACK_PUSH(sv_2mortal(newSViv(
+            px0runlen > px1runlen ? px0runlen : px1runlen))); // max runlen
+//printf("px0 == px1: %u == %u; write val\n", px0delta, px1delta);
+          px0delta = 0;
+          px1delta = 0;
+		}
+    }
+    while(*px0 || px0delta){
+      if(px0delta){
+//printf("write px0: %u\n", px0delta);
+        INLINE_STACK_PUSH(sv_2mortal(newSViv(px0delta)));
+        INLINE_STACK_PUSH(sv_2mortal(newSViv(px0runlen)));
+        px0delta = 0;
+      }
+	  if(*px0){
+        px0_next(px0, &px0delta, &px0runlen, &px0inc);
+//printf("px0 draws: delta=%u, runlen=%u, inc=%u\n", px0delta, px0runlen, px0inc);
+        px0 += px0inc; }
+    }
+    while(*px1 || px1delta){
+      if(px1delta){
+//printf("write px1: %u\n", px1delta);
+        INLINE_STACK_PUSH(sv_2mortal(newSViv(px1delta)));
+        INLINE_STACK_PUSH(sv_2mortal(newSViv(px1runlen)));
+        px1delta = 0;
+      }
+	  if(*px1){
+        px1_next(px1, &px1delta, &px1runlen, &px1inc);
+//printf("px1 draws: delta=%u, runlen=%u, inc=%u\n", px1delta, px1runlen, px1inc);
+        px1 += px1inc; }
+    }
+
     INLINE_STACK_DONE;
     return;
 }
