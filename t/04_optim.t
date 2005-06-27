@@ -70,7 +70,7 @@ for my $filename (@od0_files, @od1_files){
 $od01_index->close_index();
 
 # compact od0-1
-Seq::optimize_index('od0-1');
+Seq::fold_segments('od0-1');
 
 
 $index = Seq->open_read( 'od01' );
@@ -85,5 +85,6 @@ is_deeply($gods01, $gods0_1, 'odyssey isr compaction correct');
 
 
 exit 0;
+
 
 

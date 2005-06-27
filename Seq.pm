@@ -3,18 +3,25 @@ package Seq;
 require 5.005_62;
 use strict;
 use warnings;
-no warnings "recursion";
 use vars qw( $VERSION );
 
 use FileHandle;
 use DBI;
 use MIME::Base64;
 
-$VERSION = '0.28';
+$VERSION = '0.30';
 use Inline Config =>
-            VERSION => '0.28',
+            VERSION => '0.30',
             NAME => 'Seq';
 use Inline 'C';
+#use Inline C => Config => LIBS => '-lJudy',
+#           INC => '-I/usr/lib';
+
+
+# debugging
+#use ExtUtils::Embed;
+#use Inline C => Config => CCFLAGS => "-g"; # add debug stubs to C lib
+#use Inline Config => CLEAN_AFTER_BUILD => 0; # cp _Inline/build/../...xs .
 
 
 # Constants for data about each word.
@@ -28,6 +35,8 @@ use constant FLAGS   => 5; #
 # flag values
 use constant COMPOSITE => 1; # an isr with positions having >0 runlength
 
+use constant LEFT_NEGATION  => (1 << 1);
+use constant RIGHT_NEGATION => 1;
 
 sub open_write {
     my $type = shift;
@@ -283,7 +292,7 @@ sub _write_segment {
             print STDERR chr(13), "(", $count, ")\t\t";
         }
 
-		$sth->execute(":$word", _serialize_isr($isrs->{$word}))
+        $sth->execute(":$word", _serialize_isr($isrs->{$word}))
           or print STDERR "insert of $word failed.\n";
         delete $isrs->{$word};
     }
@@ -364,14 +373,53 @@ sub _configure {
 }
 
 
-
-sub optimize_index {
+sub segment_dirs {
     my $path = shift;
-
     my @dirs = sort { $a <=> $b }
                grep { /^\d+$/ }
                map { s/^.+?\/(\d+)$/$1/; $_ }
                glob("$path/*");
+    return @dirs;
+}
+
+
+sub fold_segments {
+    my $path = shift;
+
+    my @dirs = segment_dirs($path);
+    while(@dirs > 1){
+        fold_batch($path, @dirs);
+        @dirs = segment_dirs($path);
+    }
+}
+
+
+sub fold_batch {
+    my($path, @dirs) = @_;
+
+    my($ndocs, $nwords, $nsegments) = (0,0,0);
+    while(@dirs){
+        $nsegments++;
+        my @batch = splice(@dirs, 0, @dirs > 10 ? 10 : scalar @dirs);
+        my($seg_nwords, $seg_ndocs) = compact_batch($path, @batch);
+        $nwords += $seg_nwords;
+        $ndocs += $seg_ndocs;
+    }
+
+    my $conf = _configure($path);
+    open CONF, ">$path/conf";
+    binmode CONF;
+    print CONF 'seg_max_words:', $conf->{seg_max_words}, "\n";
+    print CONF "# DO NOT EDIT BELOW THIS LINE\n";
+    print CONF "nsegments:$nsegments\n";
+    print CONF "nwords:", $nwords, "\n";
+    print CONF "ndocs:", $ndocs, "\n";
+    close CONF;
+}
+
+
+sub compact_batch {
+    my ($path, @dirs) = @_;
 
     print STDERR "Compacting segments ", join(" ", @dirs), "\n";
 
@@ -384,7 +432,9 @@ sub optimize_index {
         my %localwords = map { $_->[0] => 1 } 
                          @{ dbselect($dbh, "select word from isrs") };
         $words{$_} = 1 for keys %localwords;
-        print STDERR "Gathered ", scalar keys %words, " words at segment $segment.           \r";
+        print STDERR status_msg("Gathered ", 
+                                 scalar keys %words, 
+                                 " words at segment $segment.");
         my $sth = $dbh->prepare("select word, isr from isrs order by word");
         $sth->execute;
         push @segments, [ $conf, $sth, "$path/$segment", \%localwords, $dbh ];
@@ -394,18 +444,27 @@ sub optimize_index {
     # new consolidated index segment
     mkdir "$path/NEWSEGMENT";
 
-    # create new cdb
-    print STDERR "Creating new compacted segment.                        \n";
+    # create new db file
+    print STDERR status_msg("Creating new compacted segment.");
     my $newidx = newsegment("$path/NEWSEGMENT");
+    $newidx->do("PRAGMA default_synchronous = OFF");
     my $isrinsert = $newidx->prepare("insert into isrs values(?,?)");
 
     my $ntokens = scalar keys %words;
+    my $alltokens = $ntokens;
     my $t0 = time;
+    my $tstart = $t0;
     for my $word (sort keys %words){
         $ntokens--;
-        if(time-$t0 > 2){
-            print STDERR "Compacting $ntokens th word: $word                       \r";
+        if(time-$t0 > 2){ # print status every ~2 seconds
             $t0 = time;
+            my $elapsed = $t0 - $tstart;
+            my $pct = 100 - int 100*$ntokens/$alltokens;
+            my $eta = int $ntokens/(($alltokens-$ntokens)/$elapsed);
+            $eta = int($eta/60) . ":" . $eta%60;
+            $elapsed = int($elapsed/60) . ":" . $elapsed%60;
+            print STDERR 
+              status_msg("Compacting $ntokens th word ($pct\%, elapsed $elapsed, eta $eta): $word");
         }
         my $isr = new_isr();
         my $ndocs = 0;
@@ -425,8 +484,8 @@ sub optimize_index {
     # write docs table, delete older segments
     my $xidinsert = $newidx->prepare("insert into docs (xid) values (?)");
     for my $segment (@segments){
-        print STDERR "Writing document ids for segment ", 
-                     $segment->[2], ", deleting segment dir.\r";
+        print STDERR status_msg("Writing document ids for segment ", 
+                                $segment->[2], ", deleting segment dir.");
         my $segids = dbselect($segment->[4], "select xid from docs");
         for(@$segids){
             $xidinsert->execute($_->[0]);
@@ -438,7 +497,7 @@ sub optimize_index {
     }
     $xidinsert->finish;
 
-    print STDERR "\nWriting tables.\n";
+    print STDERR "Writing tables.                                      \r";
     $newidx->commit;
     $newidx->disconnect;
 
@@ -451,20 +510,27 @@ sub optimize_index {
     print CONF "seg_ndocs:", $ndocs, "\n";
     close CONF;
 
-    my $conf = _configure($path);
-    open CONF, ">$path/conf";
-    binmode CONF;
-    print CONF 'seg_max_words:', $conf->{seg_max_words}, "\n";
-    print CONF "# DO NOT EDIT BELOW THIS LINE\n";
-    print CONF "nsegments:1\n";
-    print CONF "nwords:", $nwords, "\n";
-    print CONF "ndocs:", $ndocs, "\n";
-    close CONF;
+    rename "$path/NEWSEGMENT", "$path/$dirs[0]";
 
-
-    rename "$path/NEWSEGMENT", "$path/0";
+    my $elapsed = time - $tstart;
+    $elapsed = int($elapsed/60) . ":" . $elapsed%60;
+    print STDERR 
+      "Done. Segments $dirs[0] to $dirs[$#dirs] elapsed time: $elapsed\n";
+    return $nwords, $ndocs;
 }
 
+
+# format a non-scrolling one-line message for the screen
+sub status_msg {
+    my $message = shift;
+    if(length $message > 80){
+        $message = substr($message, 0, 79);
+    } else {
+        $message .= ' ' x (79 - length $message);
+    }
+    $message .= "\r";
+    return $message;
+}
 
 sub _append_isr {
     my($isr0, $seg0ndocs, $isr1) = @_;
@@ -510,7 +576,7 @@ sub _append_isr {
 
 # ISR CACHING
 
-# Isrs are cached in a closure initialized with the cdb disk hash
+# Isrs are cached in a closure initialized with the database handle
 {
     my %isrs = ();
     my %nrequests = ();
@@ -521,7 +587,7 @@ sub _append_isr {
     my $tid = 0; # term id counter
 
     # this is called by the open_read function to 
-    # instantiate the cdb object. That way only 
+    # instantiate the dbh object. That way only 
     # the individual word is necessary to call isr().
     sub isrcache_init {
         $dbh = shift;
@@ -570,14 +636,14 @@ sub _append_isr {
     }
 
     sub next_tid {
-        return '_' . $tid++ . '_';
+        return '@' . $tid++;
     }
 
     # return an id to a multi-term query, generating new one if necessary
     sub id {
         my $term = shift;
         return $term unless $term =~ / /; # no single-word searches
-        $term =~ s/_\d+_/$terms{$&}/g; # retranslate to full term
+        $term =~ s/@\d+/$terms{$&}/g; # retranslate to full term
         if(!exists $ids{$term}){
             $ids{$term} = next_tid;
             $terms{$ids{$term}} = $term;
@@ -619,7 +685,8 @@ sub sample {
         return $setid;
     }
 
-    $base = isr($self->query($base)); # base can be a query or docset
+    ($base) = $self->query($base);
+    $base = isr($base); # base can be a query or docset
     $N = $base->[NDOCS];
     my @nth = @{ _sample($r, $N) };
     my $isr = new_isr();
@@ -661,9 +728,10 @@ sub _list_isr {
     my $list = shift;
     my $isr = new_isr();
     $isr->[PX] = [ pack("w*", 0, 0) ]; # one pos+runlen serves for all
+    $isr->[FLAGS] ||= COMPOSITE;
     my $lastdoc = 0;
 
-	while(@$list){
+    while(@$list){
         my $docid = shift @$list;
         $isr->[NDOCS]++;
         $isr->[DX] .= pack("w*", ($docid-$lastdoc)*2+1, 0);
@@ -699,32 +767,36 @@ sub _sample {
 sub search {
     my $self = shift;
     my ($query, $offset, $runlen) = @_;
+    $offset ||= 0;
+    $runlen ||= 10;
 
-    return $self->set_slice(
-               $self->query($query), 
-               $offset, 
-               $runlen);
+    my($id, $canonical) = $self->query($query);
+    my %info = %{ $self->set_info($id) };
+    return [ [ $id, 
+               $canonical, 
+               $info{ndocs}, 
+               $info{nwords} ],
+             $self->set_slice($id, $offset, $runlen) ];
 }
 
 # return a result isr id from a query string. Side effect: caches
 # query and result set.
 sub query {
     my ($self, $query) = @_;
+    my $canonical = canonical($query);
     my @qtokens = split(/ /, 
-                      transcribe_query(
-                          canonical($query)));
-    return $qtokens[0] if @qtokens == 1;
-    return 0 unless opener($qtokens[0]);
+                      transcribe_query($canonical));
+    return ($qtokens[0], $canonical) if @qtokens == 1;
+    return () unless opener($qtokens[0]);
     my ($tree) = aq(@qtokens);
-    my $canonical = join(" ", @qtokens);
     isr($canonical, eval_query(@$tree)); # add to isr cache
-    return id($canonical);
+    return id($canonical), $canonical;
 }
 
 
 sub canonical {
     my $qstr = shift;
-    $qstr =~ s/[\[\]\|\<\>\(\)\{\}]/ $& /g;
+    $qstr =~ s/[\[\]\|\<\>\(\)\{\}\^]/ $& /g;
     $qstr =~ s/(#[wWtT]\d+)/$1/g;
     $qstr =~ s/^\s+//g;
     $qstr =~ s/\s+$//g;
@@ -732,48 +804,6 @@ sub canonical {
     return $qstr;
 }
 
-
-# Search results are document sets represented as a 'result_isr'.
-# 'result_isr' is a slightly different format than a regular "term" isr.
-# PX contains all PX lists, even if there is only one in a document.
-# DX is the same format, only it always has an index to PX list. 
-# PX has two numbers per position: the delta, and a runlength of the match.
-sub _execute_query {
-    my($aligner, $matcher) = @_;
-    my $isr = new_isr();
-
-    my $docid = 1;
-    my $lastdoc = 0;
-    my $nextdoc = 0;
-    while(my $nextdoc = $aligner->($docid)){
-        unless($docid == $nextdoc){
-            $docid = $nextdoc;
-            next;
-        }
-        my ($pos0, $posN) = (0, 0);
-        my $lastpos = 0;
-        my $px = '';
-        while(($pos0, $posN) = $matcher->($pos0, $posN)){
-            last if $pos0 < 0;
-            $isr->[NWORDS]++;
-            $px .= pack("w*", $pos0-$lastpos, $posN-$pos0); # delta, runlen
-            $lastpos = $pos0;
-        }
-        if($px){
-            $isr->[NDOCS]++;
-            $isr->[DX] .= pack("w*", 
-                           ($docid - $lastdoc)*2+1, # always has px list
-                            scalar @{ $isr->[PX] }); 
-            push @{ $isr->[PX] }, $px;
-            $lastdoc = $docid;
-        }
-        $docid++;
-    }
-    $isr->[LASTDOC] = $lastdoc;
-    $isr->[FLAGS] |= COMPOSITE;
-
-    return $isr;
-}
 
 
 
@@ -882,20 +912,7 @@ sub xid_iid {
     }
 }
 
-sub min {
-    return 
-      (defined $_[0]         ?
-          (defined $_[1]     ?
-              ($_[0] > $_[1] ?
-                  $_[1]      :
-                  $_[0] )    :
-              $_[0] )        :
-          $_[1] );
-}
-
-
 # new architecture
-
 {
     my %dispatch = (
         '<' => \&eval_seq,
@@ -910,6 +927,7 @@ sub min {
 }
 
 # Assemble Query
+# query is transformed to list of lists.
 sub aq {
     return undef unless @_; # empty list
     my ($op, @rest) = @_;
@@ -927,8 +945,10 @@ sub aq {
         my $word = shift @rest;
         $op .= " $word";
         if($word =~ /^#/){
-            $subquery = -$1 if $word =~ /^#[Tt](\d+)$/;
+            $subquery = -$1 if $word =~ /^#[Dd](\d+)$/;
             $subquery =  $1 if $word =~ /^#[Ww](\d+)$/;
+        } elsif($word eq '^') {
+            $subquery = $word;
         } else {
             $subquery = Seq::isr($word);
         }
@@ -946,27 +966,40 @@ sub eval_query {
   my ($qstring, @q) = @_;
   for(@q){
     if( ref($_) and opener($_->[0]) ){ # a subquery
+        my $subq_str = $_->[0];
         $_ = eval_query(@$_);
-	}
+        isr($subq_str, $_);
+    }
   }
   my $op = dispatch($qstring);
   return $op->(@q);
 }
 
+# eval a list of isrs by the () relation
+# note that negated isrs are preceded by the '^' string
 sub eval_and {
-  my @and = sort { $a->[1] <=> $b->[1] } @_;
+  my @and = @_;
+  my $neg_flag = 0;
   my $this = shift @and;
+  if($this eq '^'){
+    $neg_flag |= LEFT_NEGATION;
+    $this = shift @and;
+  }
   while(@and){
-    $this = new_and($this, shift @and);
+    if($and[0] eq '^'){
+        $neg_flag |= RIGHT_NEGATION;
+        shift @and;
+    }
+    $this = merge_and($this, shift(@and), $neg_flag);
+    $neg_flag = 0;
   }
   return $this;
-
 }
 
 sub eval_or {
   my $this = shift;
   while(@_){
-    $this = new_or($this, shift);
+    $this = merge_or($this, shift);
   }
   return $this;
 }
@@ -977,240 +1010,174 @@ sub eval_seq {
   while(@seq){
     my $interval = 1;
     $interval = shift @seq unless ref $seq[0];
-    $this = new_seq($this, shift @seq, $interval);
+    $this = merge_seq($this, shift @seq, $interval);
   }
   return $this;
 }
 
-# dx = and, px = or
-sub new_and {
-  my($isr0, $isr1) = @_;
-  return conjunctive_dx_merge($isr0, $isr1, \&disjunctive_px_merge);
+
+# new universal dx_merge takes 
+# $isr0, $isr1, $left, $center, $right, [ $interval ]
+# where left, center, right are functions on the complements and
+# intersection of the two sets
+
+sub merge_and {
+  my($isr0, $isr1, $flag) = @_;
+  return 0 if ($flag & LEFT_NEGATION) and ($flag & RIGHT_NEGATION);
+  my($left, $center, $right) = (\&px_ignore, \&px_merge, \&px_ignore);
+  ($left, $center, $right) = 
+    (\&px_ignore, \&px_ignore, \&px_upgrade)
+      if $flag & LEFT_NEGATION;
+
+  ($left, $center, $right) = 
+    (\&px_upgrade, \&px_ignore, \&px_ignore) 
+      if $flag & RIGHT_NEGATION;
+
+  return dx_merge($isr0, $isr1, $left, $center, $right);
 }
 
-# dx = or, px = or
-sub new_or {
+sub merge_or {
   my($isr0, $isr1) = @_;
-  return disjunctive_dx_merge($isr0, $isr1);
+  return dx_merge($isr0, $isr1, \&px_upgrade, \&px_merge, \&px_upgrade);
 }
 
-# dx = and, px = seq
-sub new_seq {
+sub merge_seq {
   my($isr0, $isr1, $interval) = @_;
-  my $pxmerge = sequence_px_merge($isr0, $isr1, $interval);
-  return conjunctive_dx_merge($isr0, $isr1, $pxmerge);
+  return dx_merge($isr0, $isr1, 
+                  \&px_ignore, \&px_sequence, \&px_ignore, 
+                  $interval);
 }
 
-# join two full isrs in an AND relation, combining positions 
-# according to a supplied function
-sub conjunctive_dx_merge {
-    my ($isr0, $isr1, $pxmerge) = @_;
-    return new_isr() unless $isr1->[NDOCS]; # empty isr?
+
+# Universal version of DX merge.
+# Split two isrs into left, center, and right components
+# (as in a venn diagram), and perform the specified functions
+# on each component's px list.
+# (A B) = (px_ignore, px_merge, px_ignore)
+# [A B] = (px_upgrade, px_merge, px_upgrade)
+# (A ^B) = (px_upgrade, px_ignore, px_ignore)
+# (^A B) = (px_ignore, px_ignore, px_upgrade)
+# <A ^B> = (px_upgrade, px_neg_sequence_left, px_ignore)
+# <^A B> = (px_ignore, px_neg_sequence_right, px_upgrade)
+sub dx_merge {
+    my ($isr0, $isr1, $left, $center, $right, $interval) = @_;
+    $interval ||= -1;
     my $isr = new_isr();
 
     my @dx0 = unpack "w*", $isr0->[DX];
     my @dx1 = unpack "w*", $isr1->[DX];
-    my ($flag0, $flag1) = ($isr0->[FLAGS] & COMPOSITE,
-                           $isr1->[FLAGS] & COMPOSITE);
-    my ($docid, $lastdoc) = (0,0);
-    my @DX; my @PX;
+    my ($docid, $lastdoc, $nmatches, $px) = (0,0,0,'');
+    my @DX = (); my @PX = ();
     while(@dx0 and @dx1){
         my $cmp = ($dx0[0] >> 1) <=> ($dx1[0] >> 1);
         if($cmp < 0){ # dx1 is larger
             $docid += $dx0[0] >> 1; 
             $dx1[0] = (($dx1[0] >> 1) - ($dx0[0] >> 1)) * 2 + $dx1[0] % 2;
-            shift @dx0; shift @dx0;
+            ($px, $nmatches) = $left->($isr0, splice(@dx0, 0, 2));
+            next unless $nmatches;
         }
         elsif ($cmp > 0) { # dx0 is larger
             $docid += $dx1[0] >> 1; 
             $dx0[0] = (($dx0[0] >> 1) - ($dx1[0] >> 1)) * 2 + $dx0[0] % 2;
-            shift @dx1; shift @dx1;
+            ($px, $nmatches) = $right->($isr1, splice(@dx1, 0, 2));
+            next unless $nmatches;
         }
         else {
             $docid += $dx0[0] >> 1;
-            my $dx0delta = shift @dx0; 
-            my $dx1delta = shift @dx1;
-            my $px0 = shift @dx0;
-            my $px1 = shift @dx1;
-            $px0 = ($dx0delta % 2) ?
-                      $isr0->[PX]->[$px0] :  # string px
-                      pack "w", $px0;        # single position px
-            $px1 = ($dx1delta % 2) ?
-                      $isr1->[PX]->[$px1] :  # string px
-                      pack "w", $px1;        # single position px
-            my($px, $nmatches) = $pxmerge->($px0, $px1, $flag0, $flag1);
+            ($px, $nmatches) = 
+              $center->($isr0, $isr1, 
+                        splice(@dx0,0,2), splice(@dx1,0,2), $interval);
+            next unless $nmatches;
+        }
+        $isr->[NWORDS] += $nmatches;
+        $isr->[NDOCS]++;
+        push @DX, ($docid - $lastdoc)*2+1, scalar(@PX);
+        push @PX, $px;
+        $lastdoc = $docid;
+    }
+    if(@dx0 or @dx1){
+        my($side_isr, $func, @dx) = @dx0 ? 
+                            ($isr0, $left,  @dx0) : 
+                            ($isr1, $right, @dx1);
+        while(@dx){
+            $docid += $dx[0] >> 1;
+            my($px, $nmatches) = $func->($side_isr, splice(@dx,0,2));
             next unless $nmatches;
             $isr->[NWORDS] += $nmatches;
             $isr->[NDOCS]++;
-            push @DX, ($docid - $lastdoc)*2+1, scalar(@PX);
+            push @DX, ($docid - $lastdoc)*2+1, scalar @PX;
             push @PX, $px;
             $lastdoc = $docid;
         }
     }
     $isr->[DX] = pack "w*", @DX;
-    $isr->[PX] = \@PX;
+	$isr->[PX] = \@PX;
     $isr->[LASTDOC] = $lastdoc;
     $isr->[FLAGS] |= COMPOSITE;
     return $isr;
 }
 
+# Supporting px functions for universal dx merge
+sub px_ignore {
+    # px, nmatches
+    return (undef, 0);
+}
 
-sub disjunctive_dx_merge {
-    my ($isr0, $isr1) = @_;
-    return $isr0 unless $isr1->[NDOCS]; # empty isr?
-    my $isr = new_isr();
+sub px_upgrade {
+    my($isr, $delta, $px) = @_;
+    my $nmatches;
+    if($isr->[FLAGS] & COMPOSITE){ # already upgraded, just count them
+      $px = $isr->[PX]->[$px];
+      $nmatches++ for unpack("w*", $px);
+      $nmatches /= 2;
+    } elsif ( $delta % 2 ){ # upgrade a string px
+      my @px = unpack "w*", $isr->[PX]->[$px];
+      $nmatches = @px;
+      $px = pack "w*", map { $_, 0 } @px;
+	} else { # upgrade a single position
+      $px = pack "w*", $px, 0;
+      $nmatches = 1;
+    }
+    return ($px, $nmatches);
+}
 
-    my @dx0 = unpack "w*", $isr0->[DX];
-    my @dx1 = unpack "w*", $isr1->[DX];
+# for universal dx_merge, taking two corresponding docs
+sub px_merge {
+    my($isr0, $isr1, $dx0delta, $px0, $dx1delta, $px1) = @_;
     my ($flag0, $flag1) = ($isr0->[FLAGS] & COMPOSITE,
                            $isr1->[FLAGS] & COMPOSITE);
-    my ($docid, $lastdoc) = (0,0);
-    my @DX; my @PX;
-    while(@dx0 and @dx1){
-        my($delta0, $delta1, $px0, $px1, $big, $small, $Sisr, $Bisr, $equal);
-        my $cmp = ($dx0[0] >> 1) <=> ($dx1[0] >> 1);
-        if($cmp < 0){ # dx1 is larger
-            ($big, $small, $Sisr, $equal) = 
-              (\@dx1, \@dx0, $isr0, 0);
-        }
-        elsif ($cmp > 0) { # dx0 is larger
-            ($big, $small, $Sisr, $equal) = 
-              (\@dx0, \@dx1, $isr1, 0);
-        }
-        else {
-            ($big, $small, $Bisr, $Sisr, $equal) = 
-              (\@dx0, \@dx1, $isr0, $isr1, 1);
-        }
 
-        $docid += $small->[0] >> 1;
-        if(!$equal){
-            $big->[0] = 
-              (($big->[0] >> 1) - ($small->[0] >> 1)) * 2 + $big->[0] % 2;
-            $px1 = '';
-        } else {
-            $px1 = get_px($big, $Bisr);
-        }
-        $px0 = get_px($small, $Sisr);
-        $isr->[NDOCS]++;
-        push @DX, ($docid - $lastdoc)*2+1, scalar(@PX);
-        push @PX, disjunctive_px_merge($px0, $px1, $flag0, $flag1);
-        $isr->[NWORDS] += pop @PX;
-        $lastdoc = $docid;
-    }
-    if(@dx0 or @dx1){
-        ($flag0, $isr0, @dx0) = @dx0 ? 
-                                ($flag0, $isr0, @dx0) : 
-                                ($flag1, $isr1, @dx1);
-        while(@dx0){
-            $docid += $dx0[0] >> 1;
-            $isr->[NDOCS]++;
-            push @DX, $dx0[0], scalar @PX;
-            push @PX, disjunctive_px_merge(
-                        get_px(\@dx0, $isr0), '', $flag0, 0);
-            $isr->[NWORDS] += pop @PX;
-        }
-    }
-    $isr->[DX] = pack "w*", @DX;
-    $isr->[PX] = \@PX;
-    $isr->[LASTDOC] = $docid;
-    $isr->[FLAGS] |= COMPOSITE;
-    return $isr;
+    $px0 = ($dx0delta % 2) ?
+           $isr0->[PX]->[$px0] :  # string px
+           pack "w", $px0;        # single position px
+    $px1 = ($dx1delta % 2) ?
+           $isr1->[PX]->[$px1] :  # string px
+           pack "w", $px1;        # single position px
+
+    my($px, $nmatches) = 
+      _px_merge($px0, $px1, $flag0, $flag1, 1);
+    return ($px, $nmatches);
 }
 
-sub get_px {
-    my ($dx, $isr) = @_;
-    my $delta = shift @$dx;
-    my $px = shift @$dx;
-    $px = ($delta % 2) ?
-           $isr->[PX]->[$px] :  # string px
-           pack "w", $px;        # single position px
-    return $px;
+sub px_sequence {
+    my($isr0, $isr1, $dx0delta, $px0, $dx1delta, $px1, $interval) = @_;
+    my ($flag0, $flag1) = ($isr0->[FLAGS] & COMPOSITE,
+                           $isr1->[FLAGS] & COMPOSITE);
+
+    $px0 = ($dx0delta % 2) ?
+           $isr0->[PX]->[$px0] :  # string px
+           pack "w", $px0;        # single position px
+    $px1 = ($dx1delta % 2) ?
+           $isr1->[PX]->[$px1] :  # string px
+           pack "w", $px1;        # single position px
+
+    my($px, $nmatches) = 
+      _px_sequence($px0, $px1, $flag0, $flag1, $interval);
+    return ($px, $nmatches);
 }
 
-# wrapper to keep same interface
-sub disjunctive_px_merge {
-   my @merged = _disjunctive_px_merge(@_);
-   return pack("w*", @merged), @merged/2;
-}
 
-sub disjunctive_px_merge_perl {
-  my (@px0, @px1);
 
-  # Flags indicate whether to upgrade the lists with intervals
-  $_[2] ? 
-    ( @px0 = unpack("w*", $_[0]) ) :
-    ( @px0 = map { $_, 0 } unpack("w*", $_[0]) );
-
-  $_[3] ? 
-    ( @px1 = unpack("w*", $_[1]) ) :
-    ( @px1 = map { $_, 0 } unpack("w*", $_[1]) );
-
-  return pack("w*", @px0), @px0/2 unless @px1;
-  return pack("w*", @px1), @px1/2 unless @px0;
-
-  my @px = ();
-  while(@px0 and @px1){
-    if($px0[0] <= $px1[0]){
-      my ($pxmin, $rlen) = (shift @px0, shift @px0);
-      next unless $pxmin; # don't record zeroes
-      $px1[0] -= $pxmin;
-      push @px, $pxmin, $rlen;
-    }
-    else {
-      my ($pxmin, $rlen) = (shift @px1, shift @px1);
-      next unless $pxmin; # don't record zeroes
-      $px0[0] -= $pxmin;
-      push @px, $pxmin, $rlen;
-    }
-  }
-  push @px, @px0;
-  push @px, @px1;
-  return pack("w*", @px), @px/2;
-}
-
-# curry the interval and summing functions
-sub sequence_px_merge {
- my ($isr0, $isr1, $interval) = @_;
-
-  # Flags indicate which summing function to use
-  # both are: (pos, string index, runlen) = 
-  #             s2p->(string, min pos, string index, current pos)
-  my($s2p0, $s2p1);
-  $isr0->[FLAGS] & COMPOSITE ? 
-    ($s2p0 = \&risr_sum_to_pos) :
-      ($s2p0 = \&sum_to_pos) ;
-
-  $isr1->[FLAGS] & COMPOSITE ? 
-    ($s2p1 = \&risr_sum_to_pos) :
-      ($s2p1 = \&sum_to_pos) ;
-
-  my $max_int = abs($interval);
-  my $min_int = $interval < 0 ? abs($interval) : 0;
-
-  sub {
-    my ($px0, $px1) = @_;
-
-    my ($sum0, $sum1, $n0, $n1, $pos, $runlen0, $runlen1) = (0,0,0,0,0,0);
-    my @px;
-    my $lastmatch = 0;
-    while( ($sum0, $n0, $runlen0) = 
-             $s2p0->($px0, $pos, $n0, $sum0) ) { # get next position
-      last unless $sum0 > $pos; 
-      $pos = $sum0;
-      if($sum1 < $sum0+$runlen0){
-        ($sum1, $n1, $runlen1) = 
-          $s2p1->($px1, $sum0+$runlen0, $n1, $sum1);
-      }
-      my $span = $sum1 - ($sum0+$runlen0);
-      last unless $span > 0;
-      if( $min_int <= $span and $span <=  $max_int ){
-        push @px, $sum0 - $lastmatch, $sum1+$runlen1 - $sum0; # pos delta, runlen
-        $lastmatch = $sum0;
-      }
-    }
-    return pack("w*", @px), @px/2;
-  }
-}
 
 1;
 
@@ -1221,30 +1188,156 @@ __DATA__
 
 =head1 NAME
 
-Seq - An inverted text index.
+Seq - A search and set manipulation engine for text documents
 
 =head1 ABSTRACT
 
 THIS IS ALPHA SOFTWARE
 
-Seq is a text indexer and search utility written in Perl and C. It has several special features not to be found in most available similar programs, namely arbitrarily complex sequence and alternation queries, and proximity searches with both exact counts and limits. There is no result ranking (yet). 
+Seq is a text indexer, search utility, and document set manipulator written in Perl and C. It has several special features not to be found in most available similar programs, because of a special set of requirements. Searches consist of arbitrarily complex nested queries, with conjunction, disjunction and negation of words, phrases, or otherwise designated whole document sets. Phrases have proximity operators, with both exact counts and limits. Any document or result set may be included in a subsequent query, as if it were a subquery. Also there are no stop words, so that any query, even one consisting of very common words, (eg <with the> or <for the>) will generate a result set.
 
-The index format draws some ideas from the Lucene search engine, with some simplifications and enhancements. The index segments are stored in a CDB disk hash (from dj bernstein), but support for a standard SQL database backend is coming.
+The index format draws some ideas from the Lucene search engine, with some simplifications and enhancements. The index segments are stored in an SQL database, defaulting to the zero-configuration SQLite.
 
-=head1 SYNOPSIS
+=head1 SEARCH/SET MANIPULATION SYNTAX
 
-Index documents:
+Search and set operations are internally identical, therefore any search query can be nested inside a set operation query, and vice versa.
 
-  # cat textcorpus.txt | tokenize | indexstream index_dir
-  # cat textcorpus.txt | tokenize | stopstop | indexstream index_dir
-  # optimize index_dir
+Phrases are enclosed in angle brackets '<' and '>'. Alternations, or disjunctions, are enclosed in square brackets '[' and ']'. Conjunctions are enclosed in parentheses '(' and ')'. Any delimited entity inside of another is called a subquery. Any number of entities (subqueries or words) may be in a subquery. These may be nested one within another without limit, as long as it makes logical sense. "<the quick [brown grey] fox>" is a simple valid phrase. When a subquery occurs in the context of a phrase, it is called "positional". "Positional" context is opposed to overall document set context. For instance, in the query "[dog cat]" the words do not have positional context, so it doesn't matter where they occur in the document. In "<the [dog cat]>" the subquery "[dog cat]" has positional context, so it matters where they are in a document (namely they must come right after the word "the"). 
 
-Search:
+Negation of entities are indicated with a preceding '^'. Negations can be of any entity, including words, phrases, disjunctions, and conjunctions. Negation must not occur in a void context. For instance, the whole query cannot be negated, eg "^<quick brown fox>" is not allowed but "(^<quick brown fox> <lazy dog>)" is. There must be a positive component to the query at the same level as the negation.
 
-  # seqsearch index_dir
-  # (type search terms)
+Search terms may be arbitrarily complex. For example:
+
+"<At [a the] council [of for] the [gods <deities we [love <believe in>] with all our [hearts strength]>] on olympus [hercules apollo athena <some guys>] [was were] [praised <condemned to eternal suffering in the underworld>]>"
+
+"(<frankly my dear> ^(<whatever shall I do> <wherever shall I go>))"
+
+Two operators are available to do proximity searches within phrases. '#wN' represents *at least* N intervening skips between words (the number of between words plus 1). Thus "<The #w8 dog>" would match the text "The quick brown fox jumped over the lazy dog". If #w7 or lesser had been used it would not match, but if #w9 or greater had been used it would still match. Also there is the '#dN' operator, which represents *exactly* N intervening skips. Thus for the above example "<The #d8 dog>", and no other value, would match. These operators can be used within phrases only. 
+
+
+=head1 INDEXING
+
+Several programs are provided to use for indexing documents. A typical index is created like this:
+
+ # cat textcorpus.txt | tokenizestream | indexstream index_dir
+ # optimize index_dir
+
+The indexstream program writes index segments, which are then folded together into one by the optimize program.
+
+At minimum, documents must be marked up with <DOCID> and <TEXT> sections. If raw text files are to be indexed, there is a "docize" program which can take a list of filenames and output them to stdout with the appropriate markup, using the file path as docid. For example:
+
+ # docize dir_of_textfiles/ | tokenizestream | indexstream index_dir
+
+
+
+
+=head1 TCP/IP SERVICE API
+
+There is a program included which implements a socket-based service. To use it call:
+
+ # bin/seqsvc listen-port index_dir
+
+The listener takes requests in the form:
+
+ function-name
+ arg1
+ ...
+ argn
+
+with two newlines terminating the request. So for instance to issue a search request with the query "<foo bar>" and retrieve the 20th - 30th document results, open a socket and write
+
+ search
+ <foo bar>
+ 20
+ 10
+
+The seqsvc program responds with the results and closes the socket.
+
+Results are returned in JSON format (see http://www.crockford.com/JSON/index.html). This is a simple format easily parsed by most programming languages. In particular, if only lists are used, the representation is identical to a Perl list (of lists of lists etc) and therefore can simply be eval'd in Perl. 
+
+The structure of particular results are dependent on the function called, but the most common case is the search() function, whose results are in the form of two lists. The first list contains:
+
+ query elapsed time
+ a return code (1 for success, 0 for failure)
+ result set unique ID
+ canonicalized query
+ result document count
+ result match count
+
+The second list contains the slice of results requested. These are of the form:
+
+[ docid, match1, runlength1, ... matchN, runlengthN ]
+
+Matches are indicated as deltas. That is, each represents the distance in tokens from the previous match or beginning of the document. Runlength is the length in tokens of the match. If no offset and slice size are given, the first ten result documents are returned.
+
+Here is a complete example of a call and response:
+
+ search
+ <for the>
+ 0
+ 10
+
+ [
+   [
+     0.255496,
+     1,
+     '@0',
+     '< for the >',
+     1698,
+     8534
+   ],
+   [
+     [ '333916', 232, 1, 59, 1, 171, 1, 399, 1, 107, 1 ],
+     [ '333920', 81, 1, 7, 1 ],
+     [ '333921', 70, 1 ],
+     [ '333924', 120, 1, 320, 1, 111, 1, 67, 1 ],
+     [ '333925', 347, 1, 67, 1 ],
+     [ '333926', 114, 1, 7, 1, 212, 1, 168, 1 ],
+     [ '333927', 297, 1 ],
+     [ '333930', 44, 1 ],
+     [ '333935', 181, 1, 62, 1, 290, 1, 16, 1, 29, 1, 72, 1, 83, 1 ],
+     [ '333943', 52, 1 ]
+   ]
+ ]
+
+
+Other functions, such as for sampling, are in development.
+
+
+=head1 INTERNALS
+
+Each query is compiled into a syntax tree and evaluated recursively. The operations all boil down to merging two C<posting lists>, the inverted index data structure for words/result sets. In the following I'll describe the posting lists for single words (tokens), although the format is nearly the same as for general result sets.
+
+A posting list is referred to in the code as an "isr" for historical reasons. The data structure is an array containing, most importantly, a list of documents, and a list of position lists. A position list contains all the positions in a particular document where the word appears. 
+
+The process of executing a query boils down to merging two posting lists into their left complement, intersection, and right complement (think of a Venn diagram with two circles intersecting, creating three regions). All the set and search operations are performed by doing this and then performing different combinations of functions on the documents depending on which region they are in. For instance, consider two posting lists for tokens A and B. Merging them gives us the left complement (all documents where A occurs but B does not), the intersection (where both A and B occur) and the right complement (where B occurs but A does not). If the operation is conjunction (intersection), then both left and right complement are simply ignored, and the intersection is taken as the result after merging the individual position lists. If the operation is disjunction (union), all documents found are returned, with the position lists of the complements essentially unchanged and those in the intersection merged. If the operation is a sequence (phrase search), the two complements are ignored and the intersection's position lists are checked and returned if A and B are found in the correct relation. Another example: If the operation involves a negated token, such as "(A ^B)", then both the intersection and right complement are ignored, and the left complement is taken as the result set.
+
+Where possible, the postings are merged in the optimal order, going from least frequent to most frequent tokens.
+
+
+
+=head1 TO DO
+
+Not all behavior is exactly as described in this document. 1 day.
+
+There is a bug in sequencing causing matches to be missed in rare cases. The algorithm needs redesigning. 3 days.
+
+Positional negation eg "<what ^ever>". 2-3 days.
+
+Error handling, for instance syntax checks. 2-3 days.
+
+The database backend to be generalized and network-based rather than on local disk. The socket service to be multiprocess as in typical pre-forking http server. 4-5 days.
+
+Partial result sets for speedier response. 3 days.
+
+Design a parallel database querying system which produces Seq result sets in the Seq backend. ? days.
+
+
+
 
 =head1 PROGRAMMING API
+
+Seq is a library, you can use it directly in a perl program.
 
   use Seq;
 
@@ -1253,33 +1346,23 @@ Search:
   $index->index_document( "docname", $string );
   $index->close_index();
 
+  Seq::fold_segments("indexname"); # fold all segments together
+
   # open for searching
   $index = Seq->open_read( "indexname" );
 
   # Find all docs containing a phrase
-  $result = $index->search( "this phrase and no other phrase" );
+  $result = $index->search( "<this phrase and no other phrase>" );
 
-  # result is a list:
-  # [ [ docid1, match1, match2 ... matchN ],
-  #   [ docid2, match1, ... ] ]
-  # 
-  # ... where 'match' is the token location of each match within that doc.
+$result is two lists. The first list is data about the result set:
 
-  # List information about the result set
-  $id = $index->query( "this phrase and no other phrase" );
-  $result = $index->set_info( $id );
+   [ return-code, setid, canonical-query, ndocs, nmatches ],
 
-  # $result is a hashref
-  # { ndocs => N, nmatches => M }
+Second list is a slice of the results, default results 0-9:
+   [ [ docid1, match1, length1, match2, length2 ... matchN, lengthN ],
+     [ docid2, match1, length1, ... ] ]
 
-
-=head1 SEARCH SYNTAX
-
-Sequences of words are enclosed in angle brackets '<' and '>'. Alternations are enclosed in square brackets '[' and ']'. These may be nested within each other as long as it makes logical sense. "<the quick [brown grey] fox>" is a simple valid phrase. Nested square brackets don't make sense, logically, so they aren't allowed. Also not allowed are adjacent angle bracket sequences. However, alternations may be adjacent, as in "<I [go went] [to from] the store>". As long as these rules are followed, search terms may be arbitrarily complex. For example:
-
-"<At [a the] council [of for] the [gods <deities we [love <believe in>] with all our [hearts strength]>] on olympus [hercules apollo athena <some guys>] [was were] [praised <condemned to eternal suffering in the underworld>]>"
-
-Two operators are available to do proximity searches. '#wN' represents *at least* N intervening skips between words (the number of between words plus 1). Thus "<The #w8 dog>" would match the text "The quick brown fox jumped over the lazy dog". If #w7 or lesser had been used it would not match, but if #w9 or greater had been used it would still match. Also there is the '#tN' operator, which represents *exactly* N intervening skips. Thus for the above example "<The #t8 dog>", and no other value, would match. These operators can be used after words or alternations, but no other place. 
+... where 'match' is the delta of the token location of each match within that doc.
 
 
 =head1 AUTHOR
@@ -1290,7 +1373,6 @@ Ira Joseph Woodhead, ira at sweetpota dot to
 
 C<Lucene>
 C<Plucene>
-C<CDB_File>
 C<Inline>
 
 =cut
@@ -1299,13 +1381,15 @@ C<Inline>
 __C__
 
 
+#define HIMASK 0x80 // 10000000
+#define LOMASK 0x7f // 01111111
+
 /* count how many characters make up the compressed integer 
    at the beginning of the string px. */
 int next_integer_length(char* px){
     unsigned int length = 0;
-    unsigned char mask = (1 << 7);
     //if(!*px) return 0; // empty string
-    while(*px & mask){
+    while(*px & HIMASK){
         px++;
         length++;
     }
@@ -1314,18 +1398,200 @@ int next_integer_length(char* px){
 }
 
 /* convert the compressed integer at the beginning of the string
-   px to a int. */
+   px to an int. */
 int next_integer_val(char* px){
     unsigned int value = 0;
-    unsigned char himask = (1 << 7); // 10000000
-    unsigned char lomask = 127;      // 01111111
-    while(*px & himask){
-        value = ((value << 7) | (*px & lomask));
+    while(*px & HIMASK){
+        value = ((value << 7) | (*px & LOMASK));
         px++;
     }
     value = ((value << 7) | *px);
     return (int) value;
 }
+
+/* do both above conversions. Return length on the stack and 
+   set the value in the pointed-to integer. 
+*/
+int next_integer(char* px, int* value){
+    *value = 0;
+    unsigned int length = 0;
+    while(*px & HIMASK){
+        *value = ((*value << 7) | (*px & LOMASK));
+        px++;
+        length++;
+    }
+    length++;
+    *value = ((*value << 7) | *px);
+    return (int) length;
+}
+
+// px is char*, value is int, runlen is int
+// px is incremented, value is replaced, runlen is incremented
+#define NEXT_INTEGER(px, value, length) \
+  value = 0; \
+  while(*px & HIMASK){ \
+    value = ((value << 7) | (*px & LOMASK)); \
+    px++; \
+    length++; \
+  } \
+  value = ((value << 7) | *px); \
+  px++; \
+  length++; 
+
+
+/* packs a 32-bit integer into the tail end of a string buffer 
+   as a BER, returns length. Adapted from pp_pack.c in perl source.
+*/
+int int_to_ber(unsigned int i, char* buf){
+    int bytes = (sizeof(unsigned int)*8)/7+1;
+    char  *in = buf + bytes;
+
+    do {
+      *--in = (char)((i & LOMASK) | HIMASK);
+      i >>= 7;
+    } while (i);
+    *(buf+bytes - 1) &= LOMASK; /* clear continue bit */
+    return (buf + bytes) - in;
+}
+
+
+
+
+/* next_px_0
+   takes a px string of type 0 (no runlens encoded) and sets 
+   position delta, delta ptr and delta runlen. Leaves runlen ptr and 
+   runlen runlen alone.
+*/
+void next_px_0(char** px, int* delta, 
+               char** r_ptr, int* r_runlen){  // runlen 
+     *px += next_integer(*px, delta);
+}
+
+/* next_px_1
+   takes a px string of type 1 (runlens encoded) and sets 
+   position delta, delta ptr, delta runlen, runlen ptr, runlen runlen.
+*/
+void next_px_1(char** px, int* delta, 
+               char** r_ptr, int* r_runlen){
+    *px += next_integer(*px, delta);
+    *r_ptr = *px;
+    *r_runlen = next_integer_length(*px);
+    *px += *r_runlen;
+}
+
+
+
+// macro to pack integer and copy to px
+#define WRITEDELTA(px,delta,dlen,rptr,rlen,packbuf,pxlen) \
+          dlen = int_to_ber(delta, packbuf); \
+          memcpy(px, packbuf+sizeof(packbuf)-dlen, dlen); \
+          memcpy(px+dlen, rptr, rlen); \
+          px += dlen + rlen; \
+          pxlen += dlen + rlen; 
+
+
+/* disjunctive merge
+   takes two px strings of either type and merges them disjunctively
+*/
+
+void _px_merge(SV* px0SV, SV* px1SV, bool type0, bool type1, 
+                          int interval){ // interval just for compatibility
+    char* px0 = SvPV_nolen( px0SV );
+    char* px1 = SvPV_nolen( px1SV );
+    int   dlen  = 0; 
+    char* zero = "";
+    char*  px0rptr  = zero; char* px1rptr  = zero;
+    int    px0rlen  = 1;    int   px1rlen  = 1;
+    unsigned int    px0delta = 0; unsigned int   px1delta = 0;
+    char buf[(sizeof(unsigned int)*8)/7+1];
+
+    int result_count = 0;
+    int result_len = 2*( SvCUR(px0SV) + SvCUR(px1SV) );
+    SV* result = newSVpvn(" ", result_len);
+    char* result_str = SvPV_nolen( result );
+    result_len = 0;
+
+
+    // coderefs
+    void (*px0_next)(char** px,   int* delta, 
+                     char** rptr, int* rlen);
+    void (*px1_next)(char** px,   int* delta, 
+                     char** rptr, int* rlen);
+
+
+    INLINE_STACK_VARS;
+    INLINE_STACK_RESET;
+
+    px0_next = type0 ? next_px_1 : next_px_0;
+    px1_next = type1 ? next_px_1 : next_px_0;
+
+    while(*px0 || *px1){
+        
+        // read next integers from px
+        if(px0delta == 0){
+          if(!*px0) break;
+          px0_next(&px0, &px0delta, &px0rptr, &px0rlen);
+        }
+        if(px1delta == 0){
+          if(!*px1) break;
+          px1_next(&px1, &px1delta, &px1rptr, &px1rlen);
+        }
+
+        // write appropriate result
+        if(px0delta < px1delta){
+          WRITEDELTA(result_str, px0delta, dlen, 
+                     px0rptr, px0rlen, buf, result_len);
+          result_count++;
+          px1delta -= px0delta;
+          px0delta = 0;
+        } else if(px1delta < px0delta){
+          WRITEDELTA(result_str, px1delta, dlen, 
+                     px1rptr, px1rlen, buf, result_len);
+          result_count++;
+          px0delta -= px1delta;
+          px1delta = 0;
+        } else {
+          WRITEDELTA(result_str, px0delta, dlen, 
+                     px0rptr,px0rlen, buf, result_len);
+          result_count++;
+          px0delta = 0;
+          px1delta = 0;
+        }
+    }
+
+    // one list is exhausted.
+    // continue until both lists are exhausted
+    while(*px0 || px0delta){
+      if(px0delta){
+        WRITEDELTA(result_str, px0delta, dlen, 
+                   px0rptr,px0rlen, buf, result_len);
+        result_count++;
+        px0delta = 0;
+      }
+      if(*px0){
+        px0_next(&px0, &px0delta, &px0rptr, &px0rlen);
+      }
+    }
+    while(*px1 || px1delta){
+      if(px1delta){
+        WRITEDELTA(result_str, px1delta, dlen, 
+                   px1rptr, px1rlen, buf, result_len);
+        result_count++;
+        px1delta = 0;
+      }
+      if(*px1){
+        px1_next(&px1, &px1delta, &px1rptr, &px1rlen);
+      }
+    }
+
+    SvCUR_set(result, result_len);
+    INLINE_STACK_PUSH(sv_2mortal(result));
+    INLINE_STACK_PUSH(sv_2mortal(newSViv(result_count)));
+    INLINE_STACK_DONE;
+    return;
+}
+
+
 
 
 /* px is a string of chars representing BER compressed integers.
@@ -1333,219 +1599,109 @@ int next_integer_val(char* px){
    string index, pxsum is the current sum. sum_to_pos() computes
    the first position in a document past pos.
 */
-void sum_to_pos(SV* pxSV, int pos, int pxn, int pxsum){
-    char* px = SvPV_nolen( pxSV );
+void _sum_to_pos(char* px, int pos, int* pxn, int* pxsum, int* runlen){
 
-    INLINE_STACK_VARS;
+  px += *pxn; // advance char pointer to current pxn
+  while(*px && (*pxsum <= pos)){
+    unsigned int val;
+    unsigned int len;
 
-    px += pxn; // advance char pointer to current pxn
-    while(*px && (pxsum <= pos)){
-        unsigned int len = next_integer_length(px);
-        pxsum += next_integer_val(px);
-        px += len;
-        pxn += len;
-    }
-    
-    INLINE_STACK_RESET;
-    INLINE_STACK_PUSH(sv_2mortal(newSViv(pxsum)));
-    INLINE_STACK_PUSH(sv_2mortal(newSViv(pxn)));
-    INLINE_STACK_PUSH(sv_2mortal(newSViv(0))); // runlen always 0
-    INLINE_STACK_DONE;
-    return;
+    len = next_integer(px, &val);
+    *pxsum += val;
+    px += len;
+    *pxn += len;
+  }
+  *runlen = 0;
+
+  return;
 }
 
-
-/* dx is a string of chars representing BER compressed integers.
-   These are document id deltas. dxn is the current
-   string index, dxsum is the current sum. sum_to_doc() computes
-   the first position in the corpus at or past pos, and finds the
-   integer index into px (if it exists. if it does not exist, it
-   finds the single position delta from dx).
-*/
-void sum_to_doc(SV* dxSV, int dxsum, int dxn, int pos){
-    char* dx = SvPV_nolen( dxSV );
-    int pxval = 0;
-    int last_dx_delta = 0;
-
-    INLINE_STACK_VARS;
-
-    dx += dxn; // advance char pointer to current dxn
-    while(*dx && (dxsum < pos)){
-        unsigned int len = next_integer_length(dx);
-        last_dx_delta = next_integer_val(dx);
-        dxsum += floor(last_dx_delta/2);
-        dx += len; // advance ptr
-        dxn += len;
-
-        len = next_integer_length(dx);
-        pxval = next_integer_val(dx);
-        dx += len;
-        dxn += len;
-    }
-
-    if(dxsum < pos){
-        INLINE_STACK_RESET;
-        INLINE_STACK_DONE;
-        return;
-    }
-    
-    INLINE_STACK_RESET;
-    INLINE_STACK_PUSH(sv_2mortal(newSViv(dxsum)));
-    INLINE_STACK_PUSH(sv_2mortal(newSViv(dxn)));
-    INLINE_STACK_PUSH(sv_2mortal(newSViv(pxval * 2 + (last_dx_delta % 2))));
-    INLINE_STACK_DONE;
-    return;
-}
 
 /* 
    risr_sum_to_pos() computes the first position in a document 
    past pos, plus the length of the match, which is the following number.
 */
-void risr_sum_to_pos(SV* pxSV, int pos, int pxn, int pxsum){
-    char* px = SvPV_nolen( pxSV );
-    int runlen = 0;
+void _risr_sum_to_pos(char* px, int pos, int* pxn, int* pxsum, int* runlen){
 
-    INLINE_STACK_VARS;
+  px += *pxn; // advance char pointer to current pxn
+  while(*px && (*pxsum <= pos)){
+    unsigned int val;
+    unsigned int len;
 
-    px += pxn; // advance char pointer to current pxn
-    while(*px && (pxsum <= pos)){
-        unsigned int len = next_integer_length(px);
-        pxsum += next_integer_val(px);
-        px += len;
-        pxn += len;
+    len = next_integer(px, &val);
+    *pxsum += val;
+    px += len;
+    *pxn += len;
 
-        len = next_integer_length(px);
-        runlen = next_integer_val(px);
-        px += len;
-        pxn += len;
-    }
-    
-    INLINE_STACK_RESET;
-    INLINE_STACK_PUSH(sv_2mortal(newSViv(pxsum)));
-    INLINE_STACK_PUSH(sv_2mortal(newSViv(pxn)));
-    INLINE_STACK_PUSH(sv_2mortal(newSViv(runlen)));
-    INLINE_STACK_DONE;
-    return;
+    len = next_integer(px, &val);
+    *runlen = val;
+    px += len;
+    *pxn += len;
+  }
+  return;
 }
 
 
-/* next_px_0
-   takes a px string of type 0 (no runlens encoded) and returns 
-   position delta, runlen (always 0) and string increment.
-*/
-void next_px_0(char* px, int* delta, int* runlen, int* increment){
-    *runlen = 0;
-    *delta = next_integer_val(px);
-    *increment = next_integer_length(px);
+void _px_sequence(SV* px0SV, SV* px1SV, bool type0, bool type1, 
+                       int interval){
+  char* px0 = SvPV_nolen( px0SV );
+  char* px1 = SvPV_nolen( px1SV );
+  int max_int = abs(interval);
+  int min_int = interval < 0 ? abs(interval) : 0; // neg means exact dist
+  char buf[(sizeof(unsigned int)*8)/7+1];
+
+  int sum0 = 0;    int sum1 = 0;
+  int n0 = 0;      int n1 = 0;
+  int runlen0 = 0; int runlen1 = 0;
+  int pos = 0;
+  int lastmatch = 0;
+  int span = 0;
+
+  int result_count = 0;
+  int result_len = 2*( SvCUR(px0SV) + SvCUR(px1SV) );
+  SV* result = newSVpvn(" ", result_len);
+  char* result_str = SvPV_nolen( result );
+  result_len = 0;
+
+  // coderefs for sum-to-position
+  void (*s2p0)(char* px, int pos, int* n, int* sum, int* runlen);
+  void (*s2p1)(char* px, int pos, int* n, int* sum, int* runlen); 
+
+  INLINE_STACK_VARS;
+  INLINE_STACK_RESET;
+
+  s2p0 = type0 ? _risr_sum_to_pos : _sum_to_pos;
+  s2p1 = type1 ? _risr_sum_to_pos : _sum_to_pos;
+
+  for(;;){
+    s2p0(px0, pos, &n0, &sum0, &runlen0); // get next position
+    if(sum0 <= pos) break; 
+    pos = sum0;
+    if(sum1 < sum0+runlen0)
+      s2p1(px1, sum0+runlen0, &n1, &sum1, &runlen1);
+    span = sum1 - (sum0+runlen0);
+    if(span <= 0) break;
+    if((min_int <= span) && (span <= max_int)){
+      span = int_to_ber(sum0 - lastmatch, buf); // pos delta
+      memcpy(result_str, buf+sizeof(buf)-span, span); 
+      result_str += span;
+      result_len += span;
+
+      span = int_to_ber(sum1 + runlen1 - sum0, buf); // runlen
+      memcpy(result_str, buf+sizeof(buf)-span, span);
+      result_str += span;
+      result_len += span;
+
+      lastmatch = sum0;
+      result_count++;
+    }
+  }
+
+  SvCUR_set(result, result_len);
+  INLINE_STACK_PUSH(sv_2mortal(result));
+  INLINE_STACK_PUSH(sv_2mortal(newSViv(result_count)));
+  INLINE_STACK_DONE;
+  return;
 }
-
-/* next_px_1
-   takes a px string of type 1 (runlens encoded) and returns 
-   position delta, runlen and string increment.
-*/
-void next_px_1(char* px, int* delta, int* runlen, int* increment){
-    *delta = next_integer_val(px);
-    *increment = next_integer_length(px);
-    px += *increment;
-    *runlen = next_integer_val(px);
-    *increment += next_integer_length(px);
-}
-
-
-
-/* disjunctive_px_merge
-   takes two px strings of either type and merges them disjunctively
-*/
-
-void _disjunctive_px_merge(SV* px0SV, SV* px1SV, bool type0, bool type1){
-    char* px0 = SvPV_nolen( px0SV );
-    char* px1 = SvPV_nolen( px1SV );
-    int px0inc    = 0,    px1inc = 0;
-    int px0runlen = 0, px1runlen = 0;
-    int px0delta  = 0,  px1delta = 0;
-
-	// coderefs
-    void (*px0_next)(char* px, int* delta, int* runlen, int* increment);
-    void (*px1_next)(char* px, int* delta, int* runlen, int* increment);
-
-    INLINE_STACK_VARS;
-    INLINE_STACK_RESET;
-
-    if(type0){
-        px0_next = next_px_1;
-    } else {
-        px0_next = next_px_0;
-    }
-
-    if(type1){
-        px1_next = next_px_1;
-    } else {
-        px1_next = next_px_0;
-    }
-
-    while(*px0 || *px1){
-        if(px0delta == 0){
-          if(!*px0) break;
-          px0_next(px0, &px0delta, &px0runlen, &px0inc);
-          px0 += px0inc; 
-//printf("px0 draws: delta=%u, runlen=%u, inc=%u\n", px0delta, px0runlen, px0inc);
-        }
-        if(px1delta == 0){
-          if(!*px1) break;
-          px1_next(px1, &px1delta, &px1runlen, &px1inc);
-          px1 += px1inc; 
-//printf("px1 draws: delta=%u, runlen=%u, inc=%u\n", px1delta, px1runlen, px1inc);
-        }
-        if(px0delta < px1delta){
-          INLINE_STACK_PUSH(sv_2mortal(newSViv(px0delta)));
-          INLINE_STACK_PUSH(sv_2mortal(newSViv(px0runlen)));
-//printf("px1 -= px0: %u - %u = %u; write px0\n", px1delta, px0delta, px1delta-px0delta);
-          px1delta -= px0delta;
-          px0delta = 0;
-        } else if(px1delta < px0delta){
-          INLINE_STACK_PUSH(sv_2mortal(newSViv(px1delta)));
-          INLINE_STACK_PUSH(sv_2mortal(newSViv(px1runlen)));
-//printf("px0 -= px1: %u - %u = %u; write px1\n", px0delta, px1delta, px0delta-px1delta);
-          px0delta -= px1delta;
-          px1delta = 0;
-        } else {
-          INLINE_STACK_PUSH(sv_2mortal(newSViv(px0delta)));
-          INLINE_STACK_PUSH(sv_2mortal(newSViv(
-            px0runlen > px1runlen ? px0runlen : px1runlen))); // max runlen
-//printf("px0 == px1: %u == %u; write val\n", px0delta, px1delta);
-          px0delta = 0;
-          px1delta = 0;
-		}
-    }
-    while(*px0 || px0delta){
-      if(px0delta){
-//printf("write px0: %u\n", px0delta);
-        INLINE_STACK_PUSH(sv_2mortal(newSViv(px0delta)));
-        INLINE_STACK_PUSH(sv_2mortal(newSViv(px0runlen)));
-        px0delta = 0;
-      }
-	  if(*px0){
-        px0_next(px0, &px0delta, &px0runlen, &px0inc);
-//printf("px0 draws: delta=%u, runlen=%u, inc=%u\n", px0delta, px0runlen, px0inc);
-        px0 += px0inc; }
-    }
-    while(*px1 || px1delta){
-      if(px1delta){
-//printf("write px1: %u\n", px1delta);
-        INLINE_STACK_PUSH(sv_2mortal(newSViv(px1delta)));
-        INLINE_STACK_PUSH(sv_2mortal(newSViv(px1runlen)));
-        px1delta = 0;
-      }
-	  if(*px1){
-        px1_next(px1, &px1delta, &px1runlen, &px1inc);
-//printf("px1 draws: delta=%u, runlen=%u, inc=%u\n", px1delta, px1runlen, px1inc);
-        px1 += px1inc; }
-    }
-
-    INLINE_STACK_DONE;
-    return;
-}
-
-
 
 

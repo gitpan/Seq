@@ -15,9 +15,9 @@ my $the  = Seq::isr('the');
 my $gods  = Seq::isr('gods');
 
 my $control = 
-  Seq::new_seq(
-    Seq::new_seq(
-      Seq::new_or($by, $with),
+  Seq::merge_seq(
+    Seq::merge_seq(
+      Seq::merge_or($by, $with),
       $the, 1),
     $gods, 5);
 
@@ -28,18 +28,18 @@ is_deeply($result, $control, 'compile and eval correct');
 ($tree) = Seq::aq(@query);
 $result = Seq::eval_query(@$tree);
 
-my $he   = Seq::isr('he');
-my $handed   = Seq::isr('handed');
-my $his   = Seq::isr('his');
+my $he     = Seq::isr('he');
+my $handed = Seq::isr('handed');
+my $his    = Seq::isr('his');
 my $gave   = Seq::isr('gave');
-my $daughters   = Seq::isr('daughters');
+my $daughters = Seq::isr('daughters');
 
 $control = 
-  Seq::new_seq(
-    Seq::new_seq( 
+  Seq::merge_seq(
+    Seq::merge_seq( 
       $he,
-      Seq::new_or( Seq::new_seq($handed, $his, 1),
-                   Seq::new_seq($gave, $his, 1) ), 
+      Seq::merge_or( Seq::merge_seq($handed, $his, 1),
+                     Seq::merge_seq($gave, $his, 1) ), 
       1),
     $daughters, 
     1);

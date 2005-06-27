@@ -29,3 +29,7 @@ Revision history for Perl extension Freq.
 
 0.27 Fri May  6 12:58:02 PDT 2005
 	- Replaced closure-based syntax tree with a merge-based, evaluated static tree, providing substantial speedup by eliminating subroutine calls.
+
+0.29 Fri Jun  3 15:26:35 PDT 2005
+	- (what happened to 0.28?) various optimizations. Changed query id from _N_ format to @N. Rewrote intermediate cache mechanism.
+

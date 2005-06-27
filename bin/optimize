@@ -7,7 +7,7 @@ my $indexname = shift;
 #die unless $index;
 #$index->close_index;
 
-Seq::optimize_index($indexname);
+Seq::fold_segments($indexname);
 
 exit;
 
